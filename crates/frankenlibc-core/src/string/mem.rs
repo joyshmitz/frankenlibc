@@ -3,7 +3,7 @@
 //! These are safe Rust implementations operating on byte slices.
 //! They correspond to the `<string.h>` memory functions in POSIX/C.
 
-use std::simd::{Simd, cmp::SimdPartialEq};
+use std::simd::{cmp::SimdPartialEq, Simd};
 
 /// Copies `n` bytes from `src` to `dest`.
 ///
@@ -401,11 +401,10 @@ pub fn memchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
     // of the argument in `memrchr`, and `MEMCHR_INDEX_SWEEP` exercises exactly this range.
     if count < SIMD_LANES {
         if count >= MEMCMP_EXACT_16_BYTES {
-            let head_mask = Simd::<u8, MEMCMP_EXACT_16_BYTES>::from_slice(
-                &hs[..MEMCMP_EXACT_16_BYTES],
-            )
-            .simd_eq(Simd::splat(needle))
-            .to_bitmask();
+            let head_mask =
+                Simd::<u8, MEMCMP_EXACT_16_BYTES>::from_slice(&hs[..MEMCMP_EXACT_16_BYTES])
+                    .simd_eq(Simd::splat(needle))
+                    .to_bitmask();
             if head_mask != 0 {
                 return Some(head_mask.trailing_zeros() as usize);
             }
@@ -489,6 +488,7 @@ pub fn memchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
 /// Reverse counterpart of [`memchr`]: scans 8 bytes per step from the end with
 /// the SWAR probe, resolving the exact index within the last matching word
 /// high-to-low. Behaviour is identical to a byte-at-a-time `rposition` scan.
+#[inline(always)]
 pub fn memrchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
     let count = n.min(haystack.len());
     let hs = &haystack[..count];
@@ -522,11 +522,10 @@ pub fn memrchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
             if mask != 0 {
                 return Some(count - MEMCMP_EXACT_16_BYTES + (63 - mask.leading_zeros() as usize));
             }
-            let head_mask = Simd::<u8, MEMCMP_EXACT_16_BYTES>::from_slice(
-                &hs[..MEMCMP_EXACT_16_BYTES],
-            )
-            .simd_eq(Simd::splat(needle))
-            .to_bitmask();
+            let head_mask =
+                Simd::<u8, MEMCMP_EXACT_16_BYTES>::from_slice(&hs[..MEMCMP_EXACT_16_BYTES])
+                    .simd_eq(Simd::splat(needle))
+                    .to_bitmask();
             if head_mask != 0 {
                 return Some(63 - head_mask.leading_zeros() as usize);
             }
@@ -540,6 +539,21 @@ pub fn memrchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
             i -= WORD;
         }
         return hs[..i].iter().rposition(|&b| b == needle);
+    }
+
+    // 32..=64 bytes: two overlapping 32-lane SIMD panels cover the entire slice
+    // without constructing block iterators or walking tier ladders.
+    if count <= 64 {
+        let tail = &hs[count - SIMD_LANES..];
+        let tail_mask = byte_mask_simd_32(tail, needle);
+        if tail_mask != 0 {
+            return Some(count - SIMD_LANES + (63 - tail_mask.leading_zeros() as usize));
+        }
+        let head_mask = byte_mask_simd_32(&hs[..SIMD_LANES], needle);
+        if head_mask != 0 {
+            return Some(63 - head_mask.leading_zeros() as usize);
+        }
+        return None;
     }
 
     let mut simd_blocks = hs.rchunks_exact(SIMD_FOLD_BYTES);
@@ -740,7 +754,11 @@ pub fn memmem(haystack: &[u8], n: usize, needle: &[u8], needle_len: usize) -> Op
 /// away), ASCII lowercase when true.
 #[inline(always)]
 fn fold_case<const ICASE: bool>(b: u8) -> u8 {
-    if ICASE { b.to_ascii_lowercase() } else { b }
+    if ICASE {
+        b.to_ascii_lowercase()
+    } else {
+        b
+    }
 }
 
 fn two_way_search(hay: &[u8], ndl: &[u8]) -> Option<usize> {
@@ -1364,6 +1382,41 @@ mod tests {
             memrchr(&haystack, b'Z', haystack.len()),
             Some(SIMD_LANES * 3 + 17)
         );
+    }
+
+    #[test]
+    fn test_memrchr_sweep_lengths_and_positions() {
+        // Exhaustive sweep: lengths 1..=300, needle absent and needle placed at
+        // various positions, covering every tier boundary (16, 32, 64, 128, 256).
+        for len in 1..=300 {
+            let mut buf = vec![b'x'; len];
+            assert_eq!(memrchr(&buf, b'z', len), None, "absent for len {len}");
+
+            // Test first, middle, and last positions for all lengths
+            let check_positions = [0, len / 4, len / 2, (3 * len) / 4, len - 1];
+            for &pos in &check_positions {
+                buf[pos] = b'z';
+                assert_eq!(
+                    memrchr(&buf, b'z', len),
+                    Some(pos),
+                    "hit at {pos} len {len}"
+                );
+                buf[pos] = b'x';
+            }
+
+            if len >= 2 {
+                // Two needles: at index 0 and index len - 1
+                buf[0] = b'z';
+                buf[len - 1] = b'z';
+                assert_eq!(
+                    memrchr(&buf, b'z', len),
+                    Some(len - 1),
+                    "two needles len {len}"
+                );
+                buf[0] = b'x';
+                buf[len - 1] = b'x';
+            }
+        }
     }
 
     #[test]
