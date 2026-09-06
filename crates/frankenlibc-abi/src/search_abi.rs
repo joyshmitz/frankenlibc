@@ -464,20 +464,15 @@ pub unsafe extern "C" fn tdelete(
     if handle.tree.is_empty() {
         // Free the tree state and reset *rootp so subsequent tsearch
         // sees an empty tree.
-        let _ = unsafe { Box::from_raw(handle_ptr) };
-        unsafe { *rootp = std::ptr::null_mut() };
-        // POSIX: tdelete returns "an unspecified non-null pointer" on
-        // success when the deleted node was the last one. Return the
-        // address of rootp (a stable, non-null pointer) per glibc's
-        // convention.
-        rootp as *mut c_void
-    } else {
-        // Successfully deleted, tree non-empty — POSIX says return a
-        // pointer to the parent; our LLRB doesn't track parents
-        // externally and the user only checks non-null, so return
-        // rootp.
-        rootp as *mut c_void
+        unsafe {
+            let _ = Box::from_raw(handle_ptr);
+            *rootp = std::ptr::null_mut();
+        }
     }
+    // POSIX: tdelete returns "an unspecified non-null pointer" on
+    // success when the deleted node was the last one, or a pointer to
+    // the parent. Return the address of rootp per glibc's convention.
+    rootp as *mut c_void
 }
 
 /// POSIX `twalk` — traverse a binary tree.

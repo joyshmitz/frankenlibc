@@ -200,101 +200,134 @@ impl<K> RbTree<K> {
     /// a recursive result records whether a black-height deficit needs repair.
     /// The `None` descent therefore returns without mutation, while a present
     /// key uses exactly one comparator descent. bd-z4k8bh.
+    #[inline]
     pub fn delete<F: Fn(&K, &K) -> Ordering>(&mut self, needle: &K, cmp: &F) -> Option<K> {
-        let prev_len = self.len;
-        let (new_root, removed, _shortened) = Self::delete_rec(self.root.take(), needle, cmp);
-        self.root = new_root;
-        if let Some(ref mut r) = self.root {
-            r.color = Color::Black;
+        let root = self.root.as_mut()?;
+        // Fast path: single-node tree.
+        if self.len == 1 {
+            return if cmp(needle, &root.key) == Ordering::Equal {
+                self.len = 0;
+                Some(self.root.take().unwrap().key)
+            } else {
+                None
+            };
         }
-        self.len -= usize::from(removed.is_some());
-        debug_assert_eq!(self.len + usize::from(removed.is_some()), prev_len);
+
+        let mut removed = None;
+        let _shortened = Self::delete_rec(&mut self.root, needle, cmp, &mut removed);
+        if removed.is_some() {
+            self.len -= 1;
+            if let Some(ref mut r) = self.root {
+                r.color = Color::Black;
+            }
+        }
         removed
     }
 
+    #[inline]
     fn delete_rec<F: Fn(&K, &K) -> Ordering>(
-        node: Option<Box<Node<K>>>,
+        node: &mut Option<Box<Node<K>>>,
         needle: &K,
         cmp: &F,
-    ) -> (Option<Box<Node<K>>>, Option<K>, bool) {
-        let mut h = match node {
-            None => return (None, None, false),
-            Some(h) => h,
+        removed: &mut Option<K>,
+    ) -> bool {
+        let Some(n) = node.as_deref() else {
+            return false;
         };
-        match cmp(needle, &h.key) {
+        let ord = cmp(needle, &n.key);
+        match ord {
             Ordering::Less => {
-                let (left, removed, shortened) = Self::delete_rec(h.left.take(), needle, cmp);
-                h.left = left;
+                let shortened =
+                    Self::delete_rec(&mut node.as_deref_mut().unwrap().left, needle, cmp, removed);
                 if shortened {
-                    let (fixed, still_shortened) = Self::repair_left_shortened(h);
-                    (Some(fixed), removed, still_shortened)
+                    let (fixed, still_shortened) =
+                        Self::repair_left_shortened(node.take().unwrap());
+                    *node = Some(fixed);
+                    still_shortened
                 } else {
-                    (Some(h), removed, false)
+                    false
                 }
             }
             Ordering::Greater => {
-                let (right, removed, shortened) = Self::delete_rec(h.right.take(), needle, cmp);
-                h.right = right;
-                if shortened {
-                    let (fixed, still_shortened) = Self::repair_right_shortened(h);
-                    (Some(fixed), removed, still_shortened)
-                } else {
-                    (Some(h), removed, false)
-                }
-            }
-            Ordering::Equal if h.left.is_some() && h.right.is_some() => {
-                let (right, successor, shortened) = Self::delete_min_rec(h.right.take());
-                h.right = right;
-                let old_key = core::mem::replace(
-                    &mut h.key,
-                    successor.expect("nonempty right subtree has a minimum"),
+                let shortened = Self::delete_rec(
+                    &mut node.as_deref_mut().unwrap().right,
+                    needle,
+                    cmp,
+                    removed,
                 );
                 if shortened {
-                    let (fixed, still_shortened) = Self::repair_right_shortened(h);
-                    (Some(fixed), Some(old_key), still_shortened)
+                    let (fixed, still_shortened) =
+                        Self::repair_right_shortened(node.take().unwrap());
+                    *node = Some(fixed);
+                    still_shortened
                 } else {
-                    (Some(h), Some(old_key), false)
+                    false
                 }
             }
             Ordering::Equal => {
-                let old_color = h.color;
-                let child = h.left.take().or(h.right.take());
-                let mut child = child;
-                if let Some(ref mut child) = child {
-                    child.color = Color::Black;
+                let n = node.as_deref_mut().unwrap();
+                if n.left.is_some() && n.right.is_some() {
+                    let mut succ_key = None;
+                    let shortened = Self::delete_min_rec(&mut n.right, &mut succ_key);
+                    let old_key = core::mem::replace(
+                        &mut n.key,
+                        succ_key.expect("nonempty right subtree has a minimum"),
+                    );
+                    *removed = Some(old_key);
+                    if shortened {
+                        let (fixed, still_shortened) =
+                            Self::repair_right_shortened(node.take().unwrap());
+                        *node = Some(fixed);
+                        still_shortened
+                    } else {
+                        false
+                    }
+                } else {
+                    let mut h_box = node.take().unwrap();
+                    let old_color = h_box.color;
+                    let mut child = h_box.left.take().or(h_box.right.take());
+                    if let Some(ref mut child) = child {
+                        child.color = Color::Black;
+                    }
+                    let shortened = old_color == Color::Black && child.is_none();
+                    *removed = Some(h_box.key);
+                    *node = child;
+                    shortened
                 }
-                let shortened = old_color == Color::Black && child.is_none();
-                (child, Some(h.key), shortened)
             }
         }
     }
 
-    fn delete_min_rec(node: Option<Box<Node<K>>>) -> (Option<Box<Node<K>>>, Option<K>, bool) {
-        let mut h = match node {
-            None => return (None, None, false),
-            Some(h) => h,
+    #[inline]
+    fn delete_min_rec(node: &mut Option<Box<Node<K>>>, succ_key: &mut Option<K>) -> bool {
+        let Some(n) = node.as_deref() else {
+            return false;
         };
-        if h.left.is_none() {
-            let old_color = h.color;
-            let mut child = h.right.take();
+        if n.left.is_none() {
+            let mut h_box = node.take().unwrap();
+            let old_color = h_box.color;
+            let mut child = h_box.right.take();
             if let Some(ref mut child) = child {
                 child.color = Color::Black;
             }
             let shortened = old_color == Color::Black && child.is_none();
-            return (child, Some(h.key), shortened);
+            *succ_key = Some(h_box.key);
+            *node = child;
+            return shortened;
         }
-        let (left, key, shortened) = Self::delete_min_rec(h.left.take());
-        h.left = left;
+        let shortened = Self::delete_min_rec(&mut node.as_deref_mut().unwrap().left, succ_key);
         if shortened {
-            let (fixed, still_shortened) = Self::repair_left_shortened(h);
-            (Some(fixed), key, still_shortened)
+            let (fixed, still_shortened) = Self::repair_left_shortened(node.take().unwrap());
+            *node = Some(fixed);
+            still_shortened
         } else {
-            (Some(h), key, false)
+            false
         }
     }
 
     /// Repair a one-black deficit in `h.left`. The boolean reports whether a
     /// black parent with an all-black sibling must propagate that deficit upward.
+    #[inline]
     fn repair_left_shortened(mut h: Box<Node<K>>) -> (Box<Node<K>>, bool) {
         if Self::is_red(h.right.as_deref()) {
             let mut root = Self::rotate_left(h);
@@ -353,6 +386,7 @@ impl<K> RbTree<K> {
     }
 
     /// Mirror of [`Self::repair_left_shortened`] for a deficit in `h.right`.
+    #[inline]
     fn repair_right_shortened(mut h: Box<Node<K>>) -> (Box<Node<K>>, bool) {
         if Self::is_red(h.left.as_deref()) {
             let mut root = Self::rotate_right(h);
@@ -410,10 +444,12 @@ impl<K> RbTree<K> {
         (root, false)
     }
 
+    #[inline(always)]
     fn is_red(n: Option<&Node<K>>) -> bool {
         matches!(n, Some(n) if n.color == Color::Red)
     }
 
+    #[inline(always)]
     fn rotate_left(mut h: Box<Node<K>>) -> Box<Node<K>> {
         let mut x = h.right.take().expect("rotate_left: right is None");
         h.right = x.left.take();
@@ -423,6 +459,7 @@ impl<K> RbTree<K> {
         x
     }
 
+    #[inline(always)]
     fn rotate_right(mut h: Box<Node<K>>) -> Box<Node<K>> {
         let mut x = h.left.take().expect("rotate_right: left is None");
         h.left = x.right.take();
@@ -432,6 +469,7 @@ impl<K> RbTree<K> {
         x
     }
 
+    #[inline(always)]
     fn flip_colors(h: &mut Node<K>) {
         h.color = match h.color {
             Color::Red => Color::Black,
