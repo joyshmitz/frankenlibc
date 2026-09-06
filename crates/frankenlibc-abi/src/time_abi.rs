@@ -47,7 +47,7 @@ type VdsoGetcpuFn =
 /// issues 103 and 10,003 (one per call). That is the whole of the 91.58-92.17x
 /// gap at zero bytes, and it explains why the gap collapses to 3.0x at 256 bytes
 /// where real entropy work starts to dominate.
-type VdsoGetrandomFn =
+pub(crate) type VdsoGetrandomFn =
     unsafe extern "C" fn(*mut c_void, usize, libc::c_uint, *mut c_void, usize) -> isize;
 
 /// The kernel's `vgetrandom_opaque_params`, filled by the QUERY call above.
@@ -92,11 +92,28 @@ fn tracked_optional_object_fits<T>(ptr: *const T) -> bool {
 /// Shared with `unistd_abi` so syscall wrappers can take the same fast path
 /// `clock_getres` and `gettimeofday` already use, rather than growing a second
 /// copy of the probe that could drift from this one.
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn likely_current_stack_object<T>(ptr: *const T) -> bool {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            lateout(reg) sp,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    let diff = (ptr as usize).wrapping_sub(sp);
+    diff.wrapping_add(CURRENT_STACK_OBJECT_WINDOW_BYTES) <= 2 * CURRENT_STACK_OBJECT_WINDOW_BYTES
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
 pub(crate) fn likely_current_stack_object<T>(ptr: *const T) -> bool {
     let probe = 0u8;
     let probe_addr = (&probe as *const u8) as usize;
-    (ptr as usize).abs_diff(probe_addr) <= CURRENT_STACK_OBJECT_WINDOW_BYTES
+    let diff = (ptr as usize).wrapping_sub(probe_addr);
+    diff.wrapping_add(CURRENT_STACK_OBJECT_WINDOW_BYTES) <= 2 * CURRENT_STACK_OBJECT_WINDOW_BYTES
 }
 
 #[inline]

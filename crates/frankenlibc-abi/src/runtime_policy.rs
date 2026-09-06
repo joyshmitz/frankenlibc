@@ -2075,14 +2075,14 @@ fn strict_runtime_kernel_fast_path(mode: SafetyLevel) -> bool {
 /// Use this to skip expensive validation in strict mode where we delegate to host glibc.
 /// Uses direct atomic load to avoid TLS overhead in the hot path.
 /// Note: MODE_UNRESOLVED defaults to strict, so we treat both as passthrough.
-#[inline]
+#[inline(always)]
 pub(crate) fn strict_passthrough_active() -> bool {
     if cfg!(test) {
         return false;
     }
     let state = MODE_STATE.load(AtomicOrdering::Relaxed);
     // Both unresolved (default strict) and explicit strict are passthrough
-    state == MODE_STRICT || state == MODE_UNRESOLVED
+    state <= MODE_STRICT
 }
 
 #[inline]

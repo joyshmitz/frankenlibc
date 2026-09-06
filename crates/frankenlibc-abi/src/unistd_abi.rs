@@ -131,7 +131,7 @@ fn tracked_output_capacity(ptr: *mut c_char, requested: usize) -> usize {
 ///
 /// The probe is `time_abi`'s, shared rather than copied, so this cannot drift
 /// from the `clock_getres`/`gettimeofday` path that established it.
-#[inline]
+#[inline(always)]
 fn tracked_void_output_capacity(ptr: *mut c_void, requested: usize) -> usize {
     if requested == 0 {
         return 0;
@@ -5220,48 +5220,57 @@ const VG_STATE_SLOTS: usize = 64;
 
 static VG_STATES_CLAIMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-thread_local! {
-    /// This thread's state, or null. `const` init and no `Drop`: nothing here
-    /// allocates and nothing registers a TLS destructor.
-    ///
-    /// `VG_TRIED` keeps a thread that failed to claim from re-attempting the
-    /// mmap on every single call — without it, a process past the slot limit
-    /// would pay a failed syscall on top of the real one.
-    static VG_STATE: core::cell::Cell<*mut c_void> = const { core::cell::Cell::new(core::ptr::null_mut()) };
-    static VG_TRIED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+#[derive(Clone, Copy)]
+struct VdsoDrawFast {
+    state: *mut c_void,
+    f: Option<crate::time_abi::VdsoGetrandomFn>,
+    state_len: usize,
 }
 
-/// This thread's vgetrandom state and its size, or `None` to use the syscall.
-fn vg_state() -> Option<(*mut c_void, usize)> {
-    let params = crate::time_abi::vdso_getrandom_params()?;
+thread_local! {
+    /// Cached vDSO getrandom state for this thread.
+    /// `state == NULL` means uninitialized.
+    /// `state == 1 as *mut c_void` means tried and disabled.
+    /// `state > 1` means mapped and active.
+    /// `const` init and no `Drop`: nothing here allocates and nothing registers a TLS destructor.
+    static VG_FAST: core::cell::Cell<VdsoDrawFast> = const {
+        core::cell::Cell::new(VdsoDrawFast {
+            state: core::ptr::null_mut(),
+            f: None,
+            state_len: 0,
+        })
+    };
+}
+
+#[cold]
+fn init_vdso_draw_fast() -> Option<VdsoDrawFast> {
+    let f = crate::time_abi::vdso_getrandom_fn();
+    let params = crate::time_abi::vdso_getrandom_params();
+
+    let (Some(f), Some(params)) = (f, params) else {
+        VG_FAST.with(|c| {
+            c.set(VdsoDrawFast {
+                state: 1 as *mut c_void,
+                f: None,
+                state_len: 0,
+            })
+        });
+        return None;
+    };
+
     let size = params.size_of_opaque_state as usize;
 
-    let existing = VG_STATE.with(|c| c.get());
-    if !existing.is_null() {
-        return Some((existing, size));
-    }
-    if VG_TRIED.with(|c| c.get()) {
-        return None;
-    }
-    VG_TRIED.with(|c| c.set(true));
-
-    // Claim a slot. `fetch_add` past the cap is harmless: the count only ever
-    // rises and the comparison rejects it.
     if VG_STATES_CLAIMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= VG_STATE_SLOTS {
+        VG_FAST.with(|c| {
+            c.set(VdsoDrawFast {
+                state: 1 as *mut c_void,
+                f: None,
+                state_len: 0,
+            })
+        });
         return None;
     }
 
-    // Mapped one state per slot rather than one big region carved into slots:
-    // the kernel requires a state not to straddle a page boundary, and a
-    // separate mapping makes that true by construction instead of by arithmetic
-    // this code would have to keep correct.
-    //
-    // SAFETY: an anonymous mapping of the size the kernel asked for, with the
-    // protection and flags it specified in the params query.
-    // Raw syscall rather than `libc::mmap`: the latter is a host call-through
-    // the replacement guard forbids, and in a release build it already bound to
-    // fl's own export. sys_mmap reports failure as Err rather than by returning
-    // MAP_FAILED, so the sentinel comparison goes away with it.
     let ptr = match unsafe {
         frankenlibc_core::syscall::sys_mmap(
             core::ptr::null_mut(),
@@ -5273,13 +5282,48 @@ fn vg_state() -> Option<(*mut c_void, usize)> {
         )
     } {
         Ok(ptr) => ptr as *mut c_void,
-        Err(_) => return None,
+        Err(_) => {
+            VG_FAST.with(|c| {
+                c.set(VdsoDrawFast {
+                    state: 1 as *mut c_void,
+                    f: None,
+                    state_len: 0,
+                })
+            });
+            return None;
+        }
     };
-    VG_STATE.with(|c| c.set(ptr));
-    Some((ptr, size))
+
+    let fast = VdsoDrawFast {
+        state: ptr,
+        f: Some(f),
+        state_len: size,
+    };
+    VG_FAST.with(|c| c.set(fast));
+    Some(fast)
 }
 
-/// Try to satisfy a `getrandom` from the vDSO. `None` means "use the syscall".
+#[cold]
+unsafe fn vdso_getrandom_draw_cold(
+    buf: *mut c_void,
+    buflen: usize,
+    flags: c_uint,
+    state: *mut c_void,
+) -> isize {
+    if !state.is_null() {
+        return -1;
+    }
+    let Some(fast) = init_vdso_draw_fast() else {
+        return -1;
+    };
+    let Some(f) = fast.f else {
+        return -1;
+    };
+    unsafe { f(buf, buflen, flags, fast.state, fast.state_len) }
+}
+
+/// Try to satisfy a `getrandom` from the vDSO. Returns drawn byte count (>= 0),
+/// or a negative value to fall back to the syscall.
 ///
 /// ONLY A NON-NEGATIVE RETURN IS ACCEPTED. The contract says the vDSO may
 /// decline with `-ENOSYS`, but treating every negative the same way is both
@@ -5287,14 +5331,17 @@ fn vg_state() -> Option<(*mut c_void, usize)> {
 /// reports identically, so falling through can never turn a failure into a
 /// success or change the errno a caller sees. It can only cost a syscall on a
 /// path that was going to fail anyway.
-unsafe fn vdso_getrandom_draw(buf: *mut c_void, buflen: usize, flags: c_uint) -> Option<isize> {
-    let f = crate::time_abi::vdso_getrandom_fn()?;
-    let (state, state_len) = vg_state()?;
-    // SAFETY: `state` was mapped for this thread alone with the kernel's own
-    // parameters, and `buf`/`buflen` are the caller's output buffer as already
-    // bounded by `tracked_void_output_capacity`.
-    let n = unsafe { f(buf, buflen, flags, state, state_len) };
-    (n >= 0).then_some(n)
+#[inline(always)]
+unsafe fn vdso_getrandom_draw(buf: *mut c_void, buflen: usize, flags: c_uint) -> isize {
+    let fast = VG_FAST.with(|c| c.get());
+    let state = fast.state;
+    if (state as usize) > 1 {
+        // SAFETY: state > 1 guarantees init succeeded, f is Some, state is mapped.
+        if let Some(f) = fast.f {
+            return unsafe { f(buf, buflen, flags, state, fast.state_len) };
+        }
+    }
+    unsafe { vdso_getrandom_draw_cold(buf, buflen, flags, state) }
 }
 
 /// Strict-mode `getrandom` after the policy decision has already been proven to
@@ -5305,10 +5352,11 @@ unsafe fn vdso_getrandom_draw(buf: *mut c_void, buflen: usize, flags: c_uint) ->
 /// no-op for that family. Avoid constructing that discarded decision on the
 /// successful path, while retaining the output-capacity clamp, vDSO routing,
 /// syscall fallback, errno, and adverse-result telemetry.
-#[inline]
+#[inline(always)]
 unsafe fn strict_getrandom_passthrough(buf: *mut c_void, buflen: usize, flags: c_uint) -> isize {
     let effective_buflen = tracked_void_output_capacity(buf, buflen);
-    if let Some(n) = unsafe { vdso_getrandom_draw(buf, effective_buflen, flags) } {
+    let n = unsafe { vdso_getrandom_draw(buf, effective_buflen, flags) };
+    if n >= 0 {
         return n;
     }
 
@@ -5362,7 +5410,8 @@ pub unsafe extern "C" fn getrandom(buf: *mut c_void, buflen: usize, flags: c_uin
     // state pool, a failed mapping, or any negative return from the vDSO itself.
     // The fallback is what makes the fast path safe to add — it cannot change an
     // outcome, only skip a syscall.
-    if let Some(n) = unsafe { vdso_getrandom_draw(buf, effective_buflen, flags) } {
+    let n = unsafe { vdso_getrandom_draw(buf, effective_buflen, flags) };
+    if n >= 0 {
         runtime_policy::observe(ApiFamily::IoFd, decision.profile, 8, false);
         return n;
     }
