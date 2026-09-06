@@ -113,6 +113,10 @@ const CHARSET_UTF8: u8 = 1;
 static ACTIVE_CHARSET: [std::sync::atomic::AtomicU8; locale_core::CATEGORY_COUNT] =
     [const { std::sync::atomic::AtomicU8::new(CHARSET_ASCII) }; locale_core::CATEGORY_COUNT];
 
+/// Direct pointer for `nl_langinfo(CODESET)`, published in lockstep with `ACTIVE_CHARSET`.
+static ACTIVE_CODESET_PTR: AtomicPtr<c_char> =
+    AtomicPtr::new(C_LOCALE_CODESET.as_ptr() as *mut c_char);
+
 #[inline]
 fn decode_charset(raw: u8) -> Charset {
     match raw {
@@ -155,12 +159,19 @@ fn encode_charset(charset: Charset) -> u8 {
 /// Set one category, or every category when `cat` is `LC_ALL`.
 fn set_category_charset(cat: c_int, charset: Charset) {
     let encoded = encode_charset(charset);
+    let cptr = codeset_ptr(charset) as *mut c_char;
     match locale_core::category_slot(cat) {
-        Some(slot) => ACTIVE_CHARSET[slot].store(encoded, Ordering::Release),
+        Some(slot) => {
+            ACTIVE_CHARSET[slot].store(encoded, Ordering::Release);
+            if slot == locale_core::LC_CTYPE as usize {
+                ACTIVE_CODESET_PTR.store(cptr, Ordering::Release);
+            }
+        }
         None => {
             for slot in ACTIVE_CHARSET.iter() {
                 slot.store(encoded, Ordering::Release);
             }
+            ACTIVE_CODESET_PTR.store(cptr, Ordering::Release);
         }
     }
 }
@@ -584,185 +595,183 @@ pub unsafe extern "C" fn localeconv() -> *const LConv {
 /// Only `CODESET` varies: every other item in the POSIX C locale is identical
 /// between `C` and `C.UTF-8` (both are the unlocalised English set), which is
 /// why the parameter threads through to exactly one arm.
-/// The LC_TIME name block, indexed by `item - ABDAY_1`.
+
+#[repr(transparent)]
+struct PtrTable<const N: usize>([*const c_char; N]);
+unsafe impl<const N: usize> Sync for PtrTable<N> {}
+
+/// All 50 contiguous LC_TIME string items (offsets 0..=49 from `libc::ABDAY_1`).
 ///
-/// WHY A TABLE AND NOT MORE MATCH ARMS. `nl_item` is `(category << 16) | index`,
-/// so these 38 selectors are a DENSE contiguous run and are exactly the shape the
-/// match below lowers to a jump table — one data-dependent indirect branch. A
-/// pre-registered discriminator (bd-nl-langinfo-contiguous-table-8dlrhi) measured
-/// what that costs: cycling seven selectors drawn from this run costs 3.121x
-/// glibc, while cycling seven selectors of the SAME count and cycle length drawn
-/// from three different categories costs 1.317x, and a single selector costs
-/// 1.182x. Depth in the match was refuted as the cause (0.33% between arms
-/// fourteen positions apart) and so was selector count. What is left is this run,
-/// and an index has no data-dependent branch to mispredict — which is what glibc
-/// does, and why glibc measures flat at 2.34 ns across every one of those cases.
-static LC_TIME_NAMES: [&[u8]; 38] = [
+/// In glibc, LC_TIME category enumerators start at `_NL_ITEM(__LC_TIME, 0)` (`ABDAY_1`, 131072)
+/// and run contiguously through `_NL_ITEM(__LC_TIME, 49)` (`ERA_T_FMT`, 131121).
+/// Storing direct `*const c_char` pointers avoids fat slice `&[u8]` overhead and branch misprediction.
+static LC_TIME_C_TABLE: PtrTable<50> = PtrTable([
     // ABDAY_1..=ABDAY_7 — offsets 0..=6
-    b"Sun\0",
-    b"Mon\0",
-    b"Tue\0",
-    b"Wed\0",
-    b"Thu\0",
-    b"Fri\0",
-    b"Sat\0",
+    c"Sun".as_ptr(),
+    c"Mon".as_ptr(),
+    c"Tue".as_ptr(),
+    c"Wed".as_ptr(),
+    c"Thu".as_ptr(),
+    c"Fri".as_ptr(),
+    c"Sat".as_ptr(),
     // DAY_1..=DAY_7 — offsets 7..=13
-    b"Sunday\0",
-    b"Monday\0",
-    b"Tuesday\0",
-    b"Wednesday\0",
-    b"Thursday\0",
-    b"Friday\0",
-    b"Saturday\0",
+    c"Sunday".as_ptr(),
+    c"Monday".as_ptr(),
+    c"Tuesday".as_ptr(),
+    c"Wednesday".as_ptr(),
+    c"Thursday".as_ptr(),
+    c"Friday".as_ptr(),
+    c"Saturday".as_ptr(),
     // ABMON_1..=ABMON_12 — offsets 14..=25
-    b"Jan\0",
-    b"Feb\0",
-    b"Mar\0",
-    b"Apr\0",
-    b"May\0",
-    b"Jun\0",
-    b"Jul\0",
-    b"Aug\0",
-    b"Sep\0",
-    b"Oct\0",
-    b"Nov\0",
-    b"Dec\0",
+    c"Jan".as_ptr(),
+    c"Feb".as_ptr(),
+    c"Mar".as_ptr(),
+    c"Apr".as_ptr(),
+    c"May".as_ptr(),
+    c"Jun".as_ptr(),
+    c"Jul".as_ptr(),
+    c"Aug".as_ptr(),
+    c"Sep".as_ptr(),
+    c"Oct".as_ptr(),
+    c"Nov".as_ptr(),
+    c"Dec".as_ptr(),
     // MON_1..=MON_12 — offsets 26..=37
-    b"January\0",
-    b"February\0",
-    b"March\0",
-    b"April\0",
-    b"May\0",
-    b"June\0",
-    b"July\0",
-    b"August\0",
-    b"September\0",
-    b"October\0",
-    b"November\0",
-    b"December\0",
-];
+    c"January".as_ptr(),
+    c"February".as_ptr(),
+    c"March".as_ptr(),
+    c"April".as_ptr(),
+    c"May".as_ptr(),
+    c"June".as_ptr(),
+    c"July".as_ptr(),
+    c"August".as_ptr(),
+    c"September".as_ptr(),
+    c"October".as_ptr(),
+    c"November".as_ptr(),
+    c"December".as_ptr(),
+    // AM_STR, PM_STR — offsets 38..=39
+    c"AM".as_ptr(),
+    c"PM".as_ptr(),
+    // D_T_FMT, D_FMT, T_FMT, T_FMT_AMPM — offsets 40..=43
+    c"%a %b %e %H:%M:%S %Y".as_ptr(),
+    c"%m/%d/%y".as_ptr(),
+    c"%H:%M:%S".as_ptr(),
+    c"%I:%M:%S %p".as_ptr(),
+    // ERA, __ERA_YEAR, ERA_D_FMT, ALT_DIGITS, ERA_D_T_FMT, ERA_T_FMT — offsets 44..=49
+    c"".as_ptr(),
+    c"".as_ptr(),
+    c"".as_ptr(),
+    c"".as_ptr(),
+    c"".as_ptr(),
+    c"".as_ptr(),
+]);
 
-// The table above is indexed by arithmetic on `nl_item`, so a platform whose
-// enumerators are ordered differently would silently return "Wednesday" where
-// "Mar" was asked for. These are compile-time, not tests: the `#[cfg(test)]`
-// blocks in most of this crate never compile (bd-0z7a1y), so a unit test would be
-// no protection at all.
+// Compile-time offset assertions for the table above.
 const _: () = assert!(libc::DAY_1 - libc::ABDAY_1 == 7);
-const _: () = assert!(libc::ABMON_1 - libc::ABDAY_1 == 14);
-const _: () = assert!(libc::MON_1 - libc::ABDAY_1 == 26);
-const _: () = assert!(libc::ABDAY_7 - libc::ABDAY_1 == 6);
 const _: () = assert!(libc::DAY_7 - libc::ABDAY_1 == 13);
+const _: () = assert!(libc::ABMON_1 - libc::ABDAY_1 == 14);
 const _: () = assert!(libc::ABMON_12 - libc::ABDAY_1 == 25);
+const _: () = assert!(libc::MON_1 - libc::ABDAY_1 == 26);
 const _: () = assert!(libc::MON_12 - libc::ABDAY_1 == 37);
+const _: () = assert!(libc::AM_STR - libc::ABDAY_1 == 38);
+const _: () = assert!(libc::PM_STR - libc::ABDAY_1 == 39);
+const _: () = assert!(libc::D_T_FMT - libc::ABDAY_1 == 40);
+const _: () = assert!(libc::D_FMT - libc::ABDAY_1 == 41);
+const _: () = assert!(libc::T_FMT - libc::ABDAY_1 == 42);
+const _: () = assert!(libc::T_FMT_AMPM - libc::ABDAY_1 == 43);
+const _: () = assert!(libc::ERA - libc::ABDAY_1 == 44);
+const _: () = assert!(libc::ERA_D_FMT - libc::ABDAY_1 == 46);
+const _: () = assert!(libc::ALT_DIGITS - libc::ABDAY_1 == 47);
+const _: () = assert!(libc::ERA_D_T_FMT - libc::ABDAY_1 == 48);
+const _: () = assert!(libc::ERA_T_FMT - libc::ABDAY_1 == 49);
 
-/// Branch-free lookup for the dense LC_TIME name block.
-///
-/// Returns `None` for anything outside it, which falls through to the match.
-#[inline]
-fn lc_time_name(item: libc::nl_item) -> Option<&'static [u8]> {
-    let offset = item.wrapping_sub(libc::ABDAY_1);
-    usize::try_from(offset)
-        .ok()
-        .and_then(|offset| LC_TIME_NAMES.get(offset).copied())
+const _: () = assert!(libc::CODESET == 14);
+const _: () = assert!(libc::RADIXCHAR == 65536);
+const _: () = assert!(libc::THOUSEP == 65537);
+const _: () = assert!(libc::YESEXPR == 327680);
+const _: () = assert!(libc::NOEXPR == 327681);
+const _: () = assert!(libc::CRNCYSTR == 262159);
+const _: () = assert!(262151 - (4 << 16) == 7);
+const _: () = assert!(libc::CRNCYSTR - (4 << 16) == 15);
+const _: () = assert!(libc::RADIXCHAR - (1 << 16) == 0);
+const _: () = assert!(libc::THOUSEP - (1 << 16) == 1);
+const _: () = assert!(libc::YESEXPR - (5 << 16) == 0);
+const _: () = assert!(libc::NOEXPR - (5 << 16) == 1);
+
+static LC_NUMERIC_TABLE: PtrTable<2> = PtrTable([c".".as_ptr(), c"".as_ptr()]);
+
+static LC_MONETARY_TABLE: PtrTable<9> = PtrTable([
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"\xff".as_ptr(),
+    c"-".as_ptr(),
+]);
+
+static LC_MESSAGES_TABLE: PtrTable<2> = PtrTable([c"^[yY]".as_ptr(), c"^[nN]".as_ptr()]);
+
+#[inline(always)]
+fn codeset_ptr(charset: Charset) -> *const c_char {
+    match charset {
+        Charset::Ascii => C_LOCALE_CODESET.as_ptr() as *const c_char,
+        Charset::Utf8 => UTF8_LOCALE_CODESET.as_ptr() as *const c_char,
+    }
+}
+
+#[inline(always)]
+fn langinfo_non_time_non_codeset(item: libc::nl_item) -> *const c_char {
+    let category = (item as u32) >> 16;
+    let index = ((item as u32) & 0xffff) as usize;
+    match category {
+        1 => {
+            if index < 2 {
+                // SAFETY: index is bounds-checked < 2.
+                return unsafe { *LC_NUMERIC_TABLE.0.get_unchecked(index) };
+            }
+        }
+        4 => {
+            let offset = index.wrapping_sub(7);
+            if offset < 9 {
+                // SAFETY: offset is bounds-checked < 9.
+                return unsafe { *LC_MONETARY_TABLE.0.get_unchecked(offset) };
+            }
+        }
+        5 => {
+            if index < 2 {
+                // SAFETY: index is bounds-checked < 2.
+                return unsafe { *LC_MESSAGES_TABLE.0.get_unchecked(index) };
+            }
+        }
+        _ => {}
+    }
+    c"".as_ptr()
+}
+
+#[inline(always)]
+fn langinfo_c_fast(item: libc::nl_item, charset: Charset) -> *const c_char {
+    let offset = item.wrapping_sub(libc::ABDAY_1) as usize;
+    if offset < 50 {
+        // SAFETY: offset is bounds-checked < 50.
+        return unsafe { *LC_TIME_C_TABLE.0.get_unchecked(offset) };
+    }
+    if item == libc::CODESET {
+        return codeset_ptr(charset);
+    }
+    langinfo_non_time_non_codeset(item)
 }
 
 #[inline]
 fn langinfo_value_for(charset: Charset, item: libc::nl_item) -> &'static [u8] {
-    // Dense-run fast path FIRST: it is one bounds check and one indexed load, and
-    // it covers 38 of this function's 57 arms. The match below is retained
-    // unchanged as the reference for everything else, and the differential gate
-    // against live glibc covers all 63 supported selectors either way.
-    if let Some(value) = lc_time_name(item) {
-        return value;
-    }
-    langinfo_non_lc_time_value_for(charset, item)
+    let ptr = langinfo_c_fast(item, charset);
+    // SAFETY: every pointer returned by langinfo_c_fast is a static NUL-terminated C string literal.
+    unsafe { std::ffi::CStr::from_ptr(ptr).to_bytes_with_nul() }
 }
 
-/// Lookup for selectors outside the immutable dense `LC_TIME` name block.
-///
-/// Keeping this separate lets strict `nl_langinfo` return a day/month name
-/// before reading `LC_CTYPE`: those names never depend on the active charset,
-/// while `CODESET` still must observe it.
-#[inline]
-fn langinfo_non_lc_time_value_for(charset: Charset, item: libc::nl_item) -> &'static [u8] {
-    match item {
-        libc::CODESET => codeset_for(charset),
-        libc::RADIXCHAR => C_LOCALE_RADIX,
-        libc::THOUSEP => C_LOCALE_THOUSEP,
-        // Day names (POSIX C locale, English)
-        libc::DAY_1 => b"Sunday\0",
-        libc::DAY_2 => b"Monday\0",
-        libc::DAY_3 => b"Tuesday\0",
-        libc::DAY_4 => b"Wednesday\0",
-        libc::DAY_5 => b"Thursday\0",
-        libc::DAY_6 => b"Friday\0",
-        libc::DAY_7 => b"Saturday\0",
-        // Abbreviated day names
-        libc::ABDAY_1 => b"Sun\0",
-        libc::ABDAY_2 => b"Mon\0",
-        libc::ABDAY_3 => b"Tue\0",
-        libc::ABDAY_4 => b"Wed\0",
-        libc::ABDAY_5 => b"Thu\0",
-        libc::ABDAY_6 => b"Fri\0",
-        libc::ABDAY_7 => b"Sat\0",
-        // Month names
-        libc::MON_1 => b"January\0",
-        libc::MON_2 => b"February\0",
-        libc::MON_3 => b"March\0",
-        libc::MON_4 => b"April\0",
-        libc::MON_5 => b"May\0",
-        libc::MON_6 => b"June\0",
-        libc::MON_7 => b"July\0",
-        libc::MON_8 => b"August\0",
-        libc::MON_9 => b"September\0",
-        libc::MON_10 => b"October\0",
-        libc::MON_11 => b"November\0",
-        libc::MON_12 => b"December\0",
-        // Abbreviated month names
-        libc::ABMON_1 => b"Jan\0",
-        libc::ABMON_2 => b"Feb\0",
-        libc::ABMON_3 => b"Mar\0",
-        libc::ABMON_4 => b"Apr\0",
-        libc::ABMON_5 => b"May\0",
-        libc::ABMON_6 => b"Jun\0",
-        libc::ABMON_7 => b"Jul\0",
-        libc::ABMON_8 => b"Aug\0",
-        libc::ABMON_9 => b"Sep\0",
-        libc::ABMON_10 => b"Oct\0",
-        libc::ABMON_11 => b"Nov\0",
-        libc::ABMON_12 => b"Dec\0",
-        // AM/PM
-        libc::AM_STR => b"AM\0",
-        libc::PM_STR => b"PM\0",
-        // Date/time format strings (POSIX C locale)
-        libc::D_T_FMT => b"%a %b %e %H:%M:%S %Y\0",
-        libc::D_FMT => b"%m/%d/%y\0",
-        libc::T_FMT => b"%H:%M:%S\0",
-        libc::T_FMT_AMPM => b"%I:%M:%S %p\0",
-        libc::ERA => b"\0",
-        libc::ERA_D_FMT => b"\0",
-        libc::ERA_D_T_FMT => b"\0",
-        libc::ERA_T_FMT => b"\0",
-        libc::ALT_DIGITS => b"\0",
-        libc::YESEXPR => b"^[yY]\0",
-        libc::NOEXPR => b"^[nN]\0",
-        libc::CRNCYSTR => b"-\0", // glibc C locale: "-" (currency precedes, no sign)
-        // Char-valued LC_MONETARY items. In the C locale glibc returns a pointer
-        // to a single CHAR_MAX byte (0xFF) meaning "unspecified" — mirroring the
-        // matching `char` fields of `struct lconv`. fl previously fell through to
-        // EMPTY_LOCALE_STR, so a caller read 0 (e.g. "0 fractional digits")
-        // instead of the unspecified sentinel.
-        // The `libc` crate does not export these nl_item constants. Their codes
-        // are eight consecutive LC_MONETARY items _NL_ITEM(__LC_MONETARY, 7..=14):
-        //   INT_FRAC_DIGITS=262151, FRAC_DIGITS=262152, P_CS_PRECEDES=262153,
-        //   P_SEP_BY_SPACE=262154, N_CS_PRECEDES=262155, N_SEP_BY_SPACE=262156,
-        //   P_SIGN_POSN=262157, N_SIGN_POSN=262158.
-        262151..=262158 => b"\xff\0",
-        _ => EMPTY_LOCALE_STR,
-    }
-}
-
-#[inline]
+#[cold]
+#[inline(never)]
 fn nl_langinfo_with_policy(item: libc::nl_item) -> *const c_char {
     let (_, decision) = runtime_policy::decide(ApiFamily::Locale, item as usize, 0, false, true, 0);
     if matches!(decision.action, MembraneAction::Deny) {
@@ -770,9 +779,14 @@ fn nl_langinfo_with_policy(item: libc::nl_item) -> *const c_char {
         return std::ptr::null();
     }
 
-    let value = langinfo_value_for(active_charset(), item);
+    let value = langinfo_c_fast(item, active_charset());
     runtime_policy::observe(ApiFamily::Locale, decision.profile, 6, false);
-    value.as_ptr() as *const c_char
+    value
+}
+
+#[inline(always)]
+fn active_codeset_ptr() -> *const c_char {
+    ACTIVE_CODESET_PTR.load(Ordering::Acquire)
 }
 
 /// POSIX `nl_langinfo`.
@@ -783,15 +797,19 @@ fn nl_langinfo_with_policy(item: libc::nl_item) -> *const c_char {
 #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]
 pub unsafe extern "C" fn nl_langinfo(item: libc::nl_item) -> *const c_char {
     // Strict mode cannot repair or deny this scalar selector, and every result
-    // points into the immutable C-locale table above. The LC_TIME name block
-    // is also charset-independent, so avoid its otherwise-unneeded LC_CTYPE
-    // acquire load on the per-call path. Hardened mode and tests retain the
-    // full policy path.
+    // points into the immutable C-locale table. LC_TIME selectors (offsets 0..=49)
+    // and non-CODESET items are charset-independent, avoiding an Acquire load
+    // on ACTIVE_CHARSET. Hardened mode and tests retain the full policy path.
     if runtime_policy::strict_passthrough_active() {
-        if let Some(value) = lc_time_name(item) {
-            return value.as_ptr() as *const c_char;
+        let offset = item.wrapping_sub(libc::ABDAY_1) as usize;
+        if offset < 50 {
+            // SAFETY: offset is bounds-checked < 50.
+            return unsafe { *LC_TIME_C_TABLE.0.get_unchecked(offset) };
         }
-        return langinfo_non_lc_time_value_for(active_charset(), item).as_ptr() as *const c_char;
+        if item == libc::CODESET {
+            return active_codeset_ptr();
+        }
+        return langinfo_non_time_non_codeset(item);
     }
     nl_langinfo_with_policy(item)
 }
@@ -1123,7 +1141,7 @@ pub unsafe extern "C" fn duplocale(_locale: LocaleT) -> LocaleT {
 /// `ANSI_X3.4-1968` whether or not the process locale is `C.UTF-8`.
 #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]
 pub unsafe extern "C" fn nl_langinfo_l(item: libc::nl_item, locale: *mut c_void) -> *const c_char {
-    langinfo_value_for(charset_for_handle(locale as LocaleT), item).as_ptr() as *const c_char
+    langinfo_c_fast(item, charset_for_handle(locale as LocaleT))
 }
 
 // ===========================================================================
