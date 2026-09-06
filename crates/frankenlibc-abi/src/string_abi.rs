@@ -362,117 +362,259 @@ pub fn strlen_dispatch_label_for_tests(s_addr: usize, len_hint: usize) -> &'stat
 /// store re-writes already-correct bytes at most (disjoint src), so the result is
 /// byte-identical to the scalar copy. NOT for memmove (overlap-unsafe). `n >= 1`.
 /// AVX2 128-byte-unrolled `vmovdqu` asm copy loop + minimal straight-line overlapping
-/// 32-byte tail. Inline asm ⇒ never lowered to `@llvm.memcpy` (recursion-safe). Closes the
-/// medium-copy gap: the Rust u128-pair loop emits 16-byte movups (half glibc's 32-byte
-/// ymm); this matches glibc and beats it for n>=512. `vzeroupper` avoids the AVX↔SSE
-/// transition penalty. Caller guarantees n >= 128 and AVX availability.
+/// 64-byte unaligned copy using AVX-512 vmovdqu64. Never lowered to @llvm.memcpy (recursion-safe).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn raw_avx_copy(dst: *mut u8, src: *const u8, n: usize) {
+#[target_feature(enable = "avx512f")]
+unsafe fn copy_unaligned_64(dst: *mut u8, src: *const u8) {
     unsafe {
-        // Dest-align peel: glibc aligns the destination so its 32B stores never cross a
-        // 64B cache line; fl's `vmovdqu` stores split when `dst` is unaligned (measured
-        // ~1.32x vs glibc at n=16384, dst+16; the aligned-dst cases are parity-to-win).
-        // When `dst` is unaligned AND n is large enough to keep the aligned loop's first
-        // (mandatory do-while) 128B iteration in bounds (head <= 31, so head+128 <= n),
-        // copy the first 32B unaligned to cover the sub-32 head, then run an aligned-STORE
-        // loop (`vmovdqa`) from the next 32-aligned `dst` offset. `src` stays `vmovdqu`
-        // (load splits are cheaper; only one operand needs aligning). Byte-identical:
-        // disjoint copy, the head's `[head,32)` bytes are re-written with the same data by
-        // the loop's first store; all offsets stay in `[0, n)`.
-        let head = (32 - (dst as usize & 31)) & 31;
-        if head != 0 && head + 128 <= n {
-            copy_unaligned_32(dst, src); // covers [0, 32) ⊇ [0, head)
-            let mut d = dst.add(head);
-            let mut s = src.add(head);
-            let mut rem = n - head;
-            core::arch::asm!(
-                "2:",
-                "vmovdqu ymm0, [{s}]",
-                "vmovdqu ymm1, [{s}+32]",
-                "vmovdqu ymm2, [{s}+64]",
-                "vmovdqu ymm3, [{s}+96]",
-                "vmovdqa [{d}], ymm0",
-                "vmovdqa [{d}+32], ymm1",
-                "vmovdqa [{d}+64], ymm2",
-                "vmovdqa [{d}+96], ymm3",
-                "add {s}, 128",
-                "add {d}, 128",
-                "sub {rem}, 128",
-                "cmp {rem}, 128",
-                "jae 2b",
-                "vzeroupper",
-                s = inout(reg) s,
-                d = inout(reg) d,
-                rem = inout(reg) rem,
-                out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
-                options(nostack),
-            );
-            let _ = (d, s);
-            // rem ∈ [0,128): cover the final bytes with overlapping 32B end-copies
-            // (absolute offsets from dst, independent of the peel).
-            if rem > 96 {
-                copy_unaligned_32(dst.add(n - 128), src.add(n - 128));
-                copy_unaligned_32(dst.add(n - 96), src.add(n - 96));
-                copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-                copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
-            } else if rem > 64 {
-                copy_unaligned_32(dst.add(n - 96), src.add(n - 96));
-                copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-                copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
-            } else if rem > 32 {
-                copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-                copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
-            } else if rem > 0 {
-                copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
-            }
-            return;
+        core::arch::asm!(
+            "vmovdqu64 zmm0, [{s}]",
+            "vmovdqu64 [{d}], zmm0",
+            s = in(reg) src,
+            d = in(reg) dst,
+            out("zmm0") _,
+            options(nostack),
+        );
+    }
+}
+
+/// AVX-512 unrolled 256-byte loop descending from high to low. Used when dst and src
+/// share the same page offset modulo 4096 (4K aliasing), which causes store-forwarding stalls
+/// on forward sequential copies. Backward order eliminates the store-forwarding collision.
+/// Destination tail is peeled to 64-byte alignment; copies 256 bytes per iteration with 4 ZMM registers.
+/// Remainder at the low end is covered with minimal overlapping 64-byte copies.
+/// Caller guarantees n >= 384 and AVX-512F availability.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn raw_avx512_copy_backward(dst: *mut u8, src: *const u8, n: usize) {
+    unsafe {
+        let tail = (dst.add(n) as usize) & 63;
+        if tail != 0 {
+            copy_unaligned_64(dst.add(n - 64), src.add(n - 64));
         }
-        // Original path: `dst` already 32-aligned (`vmovdqu` on an aligned address is
-        // free) OR n too small to peel. Unchanged.
-        let mut d = dst;
-        let mut s = src;
-        let mut rem = n;
+        let mut d = dst.add(n - tail);
+        let mut s = src.add(n - tail);
+        let end = dst.add(256);
         core::arch::asm!(
             "2:",
-            "vmovdqu ymm0, [{s}]",
-            "vmovdqu ymm1, [{s}+32]",
-            "vmovdqu ymm2, [{s}+64]",
-            "vmovdqu ymm3, [{s}+96]",
-            "vmovdqu [{d}], ymm0",
-            "vmovdqu [{d}+32], ymm1",
-            "vmovdqu [{d}+64], ymm2",
-            "vmovdqu [{d}+96], ymm3",
-            "add {s}, 128",
-            "add {d}, 128",
-            "sub {rem}, 128",
-            "cmp {rem}, 128",
+            "sub {s}, 256",
+            "vmovdqu64 zmm0, [{s}]",
+            "vmovdqu64 zmm1, [{s}+64]",
+            "vmovdqu64 zmm2, [{s}+128]",
+            "vmovdqu64 zmm3, [{s}+192]",
+            "sub {d}, 256",
+            "vmovdqa64 [{d}], zmm0",
+            "vmovdqa64 [{d}+64], zmm1",
+            "vmovdqa64 [{d}+128], zmm2",
+            "vmovdqa64 [{d}+192], zmm3",
+            "cmp {d}, {end}",
             "jae 2b",
             "vzeroupper",
             s = inout(reg) s,
             d = inout(reg) d,
-            rem = inout(reg) rem,
-            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            end = in(reg) end,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             options(nostack),
         );
-        let _ = (d, s);
-        // rem ∈ [0,128): cover [n-rem,n) with the minimal count of straight-line,
-        // overlapping 32-byte copies from the end (no loop ⇒ not @llvm.memcpy). n>=128.
-        if rem > 96 {
-            copy_unaligned_32(dst.add(n - 128), src.add(n - 128));
-            copy_unaligned_32(dst.add(n - 96), src.add(n - 96));
-            copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-            copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
+        let rem = d as usize - dst as usize;
+        if rem > 192 {
+            copy_unaligned_64(dst.add(192), src.add(192));
+            copy_unaligned_64(dst.add(128), src.add(128));
+            copy_unaligned_64(dst.add(64), src.add(64));
+            copy_unaligned_64(dst, src);
+        } else if rem > 128 {
+            copy_unaligned_64(dst.add(128), src.add(128));
+            copy_unaligned_64(dst.add(64), src.add(64));
+            copy_unaligned_64(dst, src);
         } else if rem > 64 {
-            copy_unaligned_32(dst.add(n - 96), src.add(n - 96));
-            copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-            copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
-        } else if rem > 32 {
-            copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
-            copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
+            copy_unaligned_64(dst.add(64), src.add(64));
+            copy_unaligned_64(dst, src);
         } else if rem > 0 {
-            copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
+            copy_unaligned_64(dst, src);
         }
+        if rem > 0 {
+            core::arch::asm!("vzeroupper", options(nostack));
+        }
+    }
+}
+
+/// AVX-512 unrolled 256-byte loop with 64-byte aligned stores (matching glibc's __memcpy_avx512).
+/// Destination is peeled to 64-byte alignment; copies 256 bytes per iteration with 4 ZMM registers.
+/// Remainder is covered with minimal overlapping 64-byte copies from the end.
+/// Checks 4K-aliasing: if (dst ^ src) & 0xfff == 0, routes to raw_avx512_copy_backward to avoid
+/// store-forwarding stalls (matching glibc's 4K-aliasing branch at 0x1b0d00).
+/// Caller guarantees n >= 384 and AVX-512F availability.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn raw_avx512_copy(dst: *mut u8, src: *const u8, n: usize) {
+    if (dst as usize).wrapping_sub(src as usize) & 0xf00 == 0 {
+        unsafe { raw_avx512_copy_backward(dst, src, n) };
+        return;
+    }
+    unsafe {
+        let head = (64 - (dst as usize & 63)) & 63;
+        if head != 0 {
+            copy_unaligned_64(dst, src);
+        }
+        let mut d = dst.add(head);
+        let mut s = src.add(head);
+        let end = dst.add(n - 256);
+        core::arch::asm!(
+            "2:",
+            "vmovdqu64 zmm0, [{s}]",
+            "vmovdqu64 zmm1, [{s}+64]",
+            "vmovdqu64 zmm2, [{s}+128]",
+            "vmovdqu64 zmm3, [{s}+192]",
+            "add {s}, 256",
+            "vmovdqa64 [{d}], zmm0",
+            "vmovdqa64 [{d}+64], zmm1",
+            "vmovdqa64 [{d}+128], zmm2",
+            "vmovdqa64 [{d}+192], zmm3",
+            "add {d}, 256",
+            "cmp {d}, {end}",
+            "jbe 2b",
+            "vzeroupper",
+            s = inout(reg) s,
+            d = inout(reg) d,
+            end = in(reg) end,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            options(nostack),
+        );
+        let rem = dst.add(n) as usize - d as usize;
+        if rem > 192 {
+            copy_unaligned_64(dst.add(n - 256), src.add(n - 256));
+            copy_unaligned_64(dst.add(n - 192), src.add(n - 192));
+            copy_unaligned_64(dst.add(n - 128), src.add(n - 128));
+            copy_unaligned_64(dst.add(n - 64), src.add(n - 64));
+        } else if rem > 128 {
+            copy_unaligned_64(dst.add(n - 192), src.add(n - 192));
+            copy_unaligned_64(dst.add(n - 128), src.add(n - 128));
+            copy_unaligned_64(dst.add(n - 64), src.add(n - 64));
+        } else if rem > 64 {
+            copy_unaligned_64(dst.add(n - 128), src.add(n - 128));
+            copy_unaligned_64(dst.add(n - 64), src.add(n - 64));
+        } else if rem > 0 {
+            copy_unaligned_64(dst.add(n - 64), src.add(n - 64));
+        }
+        if rem > 0 {
+            core::arch::asm!("vzeroupper", options(nostack));
+        }
+    }
+}
+
+/// AVX unrolled 256-byte loop descending from high to low. Used when dst and src
+/// share the same page offset modulo 4096 (4K aliasing), which causes store-forwarding stalls
+/// on forward sequential copies. Backward order eliminates the store-forwarding collision.
+/// Destination tail is peeled to 32-byte alignment; copies 256 bytes per iteration with 8 YMM registers.
+/// Remainder at the low end is covered with minimal overlapping 32-byte copies.
+/// AVX backward copy for 4K-aliasing: (dst ^ src) & 0xfff == 0.
+/// Preserves head [0..128) in ymm0, ymm5, ymm6, ymm7 and tail [n-32..n) in ymm8.
+/// Aligns destination end to 32 bytes and copies in 128-byte descending steps.
+/// Overlapping stores at head and tail eliminate all scalar/branchy remainder handling.
+/// Matches glibc's __memcpy_avx_unaligned_erms backward loop.
+/// Caller guarantees n >= 384 and AVX availability.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn raw_avx_copy_backward_disjoint(dst: *mut u8, src: *const u8, n: usize) {
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{s}]",
+            "vmovdqu ymm5, [{s}+32]",
+            "vmovdqu ymm6, [{s}+64]",
+            "vmovdqu ymm7, [{s}+96]",
+            "vmovdqu ymm8, [{s}+{n}-32]",
+            "lea {d_end}, [{d}+{n}-129]",
+            "and {d_end}, -32",
+            "sub {s}, {d}",
+            "add {s}, {d_end}",
+            "2:",
+            "vmovdqu ymm1, [{s}+96]",
+            "vmovdqu ymm2, [{s}+64]",
+            "vmovdqu ymm3, [{s}+32]",
+            "vmovdqu ymm4, [{s}]",
+            "add {s}, -128",
+            "vmovdqa [{d_end}+96], ymm1",
+            "vmovdqa [{d_end}+64], ymm2",
+            "vmovdqa [{d_end}+32], ymm3",
+            "vmovdqa [{d_end}], ymm4",
+            "add {d_end}, -128",
+            "cmp {d_end}, {d}",
+            "ja 2b",
+            "vmovdqu [{d}], ymm0",
+            "vmovdqu [{d}+32], ymm5",
+            "vmovdqu [{d}+64], ymm6",
+            "vmovdqu [{d}+96], ymm7",
+            "vmovdqu [{d}+{n}-32], ymm8",
+            "vzeroupper",
+            d = in(reg) dst,
+            s = inout(reg) src => _,
+            n = in(reg) n,
+            d_end = out(reg) _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _,
+            options(nostack),
+        );
+    }
+}
+
+/// AVX unrolled forward copy matching glibc's __memcpy_avx_unaligned_erms.
+/// Destination is peeled to 32-byte alignment.
+/// Preserves head [0..32) in ymm0 and tail [n-128..n) in ymm5, ymm6, ymm7, ymm8.
+/// Copies in 128-byte ascending steps with 32-byte aligned stores.
+/// Overlapping stores at head and tail eliminate all scalar/branchy remainder handling.
+/// Checks 4K-aliasing: if (dst ^ src) & 0xfff == 0, routes to raw_avx_copy_backward_disjoint to avoid
+/// store-forwarding stalls (matching glibc's 4K-aliasing branch at offset 0x9c/0xa5).
+/// Caller guarantees n >= 384 and AVX availability.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn raw_avx_copy(dst: *mut u8, src: *const u8, n: usize) {
+    if (dst as usize).wrapping_sub(src as usize) & 0xf00 == 0 {
+        unsafe { raw_avx_copy_backward_disjoint(dst, src, n) };
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{s}]",
+            "vmovdqu ymm5, [{s}+{n}-32]",
+            "vmovdqu ymm6, [{s}+{n}-64]",
+            "vmovdqu ymm7, [{s}+{n}-96]",
+            "vmovdqu ymm8, [{s}+{n}-128]",
+            "mov {orig_d}, {d}",
+            "or {d}, 31",
+            "inc {d}",
+            "sub {s}, {orig_d}",
+            "add {s}, {d}",
+            "lea {d_end}, [{orig_d}+{n}-128]",
+            "2:",
+            "vmovdqu ymm1, [{s}]",
+            "vmovdqu ymm2, [{s}+32]",
+            "vmovdqu ymm3, [{s}+64]",
+            "vmovdqu ymm4, [{s}+96]",
+            "add {s}, 128",
+            "vmovdqa [{d}], ymm1",
+            "vmovdqa [{d}+32], ymm2",
+            "vmovdqa [{d}+64], ymm3",
+            "vmovdqa [{d}+96], ymm4",
+            "add {d}, 128",
+            "cmp {d}, {d_end}",
+            "jb 2b",
+            "vmovdqu [{d_end}+96], ymm5",
+            "vmovdqu [{d_end}+64], ymm6",
+            "vmovdqu [{d_end}+32], ymm7",
+            "vmovdqu [{d_end}], ymm8",
+            "vmovdqu [{orig_d}], ymm0",
+            "vzeroupper",
+            d = inout(reg) dst => _,
+            s = inout(reg) src => _,
+            n = in(reg) n,
+            orig_d = out(reg) _,
+            d_end = out(reg) _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _,
+            options(nostack),
+        );
     }
 }
 
@@ -832,6 +974,31 @@ unsafe fn raw_copy_128_to_256(dst: *mut u8, src: *const u8, n: usize) {
     }
 }
 
+/// [256, 384): straight-line overlapping 32-byte windows. Covers [0, 256) with eight
+/// straight-line 32B copies, then [n-128, n) with overlapping 32B copies from the end.
+/// Eliminates loop setup and alignment peel overhead for sub-384 sizes.
+#[inline]
+unsafe fn raw_copy_256_to_384(dst: *mut u8, src: *const u8, n: usize) {
+    unsafe {
+        copy_unaligned_32(dst, src);
+        copy_unaligned_32(dst.add(32), src.add(32));
+        copy_unaligned_32(dst.add(64), src.add(64));
+        copy_unaligned_32(dst.add(96), src.add(96));
+        copy_unaligned_32(dst.add(128), src.add(128));
+        copy_unaligned_32(dst.add(160), src.add(160));
+        copy_unaligned_32(dst.add(192), src.add(192));
+        copy_unaligned_32(dst.add(224), src.add(224));
+        if n > 320 {
+            copy_unaligned_32(dst.add(n - 128), src.add(n - 128));
+            copy_unaligned_32(dst.add(n - 96), src.add(n - 96));
+        }
+        copy_unaligned_32(dst.add(n - 64), src.add(n - 64));
+        copy_unaligned_32(dst.add(n - 32), src.add(n - 32));
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("vzeroupper", options(nostack));
+    }
+}
+
 #[inline]
 pub(crate) unsafe fn raw_overlap_copy(dst: *mut u8, src: *const u8, n: usize) {
     unsafe {
@@ -841,19 +1008,24 @@ pub(crate) unsafe fn raw_overlap_copy(dst: *mut u8, src: *const u8, n: usize) {
             raw_copy_128_to_256(dst, src, n);
             return;
         }
-        // Medium copies [256,131072): AVX vmovdqu loop. Measured DIRECT dlmopen A/B
-        // (memcpy_direct_ab / memcpy_xover) OVERTURNED the old "rep movsb beats glibc for
-        // [4096,32768)" claim — rep movsb actually LOST 1.6-1.7x across [2048,8192] and a
-        // catastrophic 3.87x at 16 KiB (ERMS 4K-aliasing store-forward stall), while the AVX
-        // loop is parity vs glibc across the whole [2048,131072) range (0.99-1.03x, spike
-        // gone). So the AVX loop is the medium-large path; rep movsb (ERMS, cache-friendly
-        // for huge copies past L2) stays only for >=128 KiB. Gated on runtime AVX; non-AVX
-        // machines fall through to the rep movsb / u128-pair paths below unchanged.
-        #[cfg(target_arch = "x86_64")]
-        if (256..131072).contains(&n) && std::is_x86_feature_detected!("avx") {
-            // SAFETY: n in [256,131072) and AVX confirmed available.
-            raw_avx_copy(dst, src, n);
+        if (256..384).contains(&n) {
+            raw_copy_256_to_384(dst, src, n);
             return;
+        }
+        // Medium copies [384,131072): AVX-512 / AVX unrolled loop (256 bytes per iteration)
+        // with destination aligned stores and 4K-aliasing backward copy protection.
+        #[cfg(target_arch = "x86_64")]
+        if (384..131072).contains(&n) {
+            if std::is_x86_feature_detected!("avx512f") {
+                // SAFETY: n in [384,131072) and AVX-512F confirmed available.
+                raw_avx512_copy(dst, src, n);
+                return;
+            }
+            if std::is_x86_feature_detected!("avx") {
+                // SAFETY: n in [384,131072) and AVX confirmed available.
+                raw_avx_copy(dst, src, n);
+                return;
+            }
         }
         // Huge copies (>=128 KiB) and the non-AVX medium-large fallback: `rep movsb` (x86
         // ERMS) — glibc's large-memcpy path. Inline asm is opaque to LLVM's loop-idiom

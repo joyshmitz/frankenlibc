@@ -3286,3 +3286,43 @@ fn bd_jt6vm_consttime_bcmp_zero_len_returns_zero() {
     let r = unsafe { consttime_bcmp(std::ptr::null(), std::ptr::null(), 0) };
     assert_eq!(r, 0);
 }
+
+#[test]
+fn bd_4ibo52_large_memcpy_conformance_and_aliasing() {
+    use frankenlibc_abi::string_abi::memcpy;
+
+    let sizes = [
+        128, 200, 256, 320, 383, 384, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    ];
+
+    for &n in &sizes {
+        // Test with 4K-aliased buffers ((dst - src) & 0xf00 == 0)
+        let mut src_buf = vec![0u8; n + 128];
+        let mut dst_buf = vec![0xEEu8; n + 128];
+        for (i, byte) in src_buf.iter_mut().enumerate() {
+            *byte = ((i * 37 + 101) & 0xFF) as u8;
+        }
+
+        // 1. Aligned copy (triggering 4K-aliasing backward path when offsets match)
+        let res = unsafe { memcpy(dst_buf.as_mut_ptr().cast(), src_buf.as_ptr().cast(), n) };
+        assert_eq!(res, dst_buf.as_mut_ptr().cast());
+        assert_eq!(&dst_buf[..n], &src_buf[..n]);
+        assert_eq!(dst_buf[n], 0xEE);
+
+        // 2. Unaligned copy with various alignment offsets
+        for offset_d in [1, 7, 15, 31] {
+            for offset_s in [0, 3, 11, 23] {
+                let mut unaligned_dst = vec![0xDDu8; n + 64];
+                let src_slice = &src_buf[offset_s..offset_s + n];
+                let dst_ptr = unsafe { unaligned_dst.as_mut_ptr().add(offset_d).cast() };
+                let res = unsafe { memcpy(dst_ptr, src_slice.as_ptr().cast(), n) };
+                assert_eq!(res, dst_ptr);
+                assert_eq!(&unaligned_dst[offset_d..offset_d + n], src_slice);
+                assert_eq!(unaligned_dst[offset_d + n], 0xDD);
+                if offset_d > 0 {
+                    assert_eq!(unaligned_dst[offset_d - 1], 0xDD);
+                }
+            }
+        }
+    }
+}
