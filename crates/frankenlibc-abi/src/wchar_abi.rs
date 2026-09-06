@@ -3847,6 +3847,7 @@ const WIDE_SCAN_PAGE: usize = 4096;
 ///
 /// `s` must be readable up to the first NUL or `bound` wide elements, whichever
 /// comes first.
+#[inline(always)]
 unsafe fn wide_nul_or_bound(s: *const u32, bound: usize) -> usize {
     const ELEM: usize = size_of::<u32>();
 

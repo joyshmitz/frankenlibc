@@ -282,14 +282,15 @@ fn find_wide_or_nul_long(s: &[u32], needle: u32) -> usize {
 /// Scans `WIDE_NUL_SIMD_LANES` elements per step with a portable-SIMD NUL probe,
 /// then resolves the exact index within the first matching panel left-to-right.
 /// Behaviour is identical to a scalar `position(|&c| c == 0)` scan.
+#[inline(always)]
 pub fn wcslen(s: &[u32]) -> usize {
     // Fold four 64-lane panels per 256-element block into ONE horizontal
     // reduction (mirroring the narrow `block_has_nul_256` for strlen). Because
     // `min(a, b) == 0` iff either lane is `0`, the folded vector has a zero lane
     // exactly when one of the four panels does, so the steady-state NUL-free scan
     // pays a single reduction per 256 wide chars instead of one per 16. The
-    // scalar tail resolves the exact index inside a flagged block, so the
-    // returned length is identical to the per-chunk scan (bd-2g7oyh).
+    // scalar tail resolves the exact index inside a flagged block, so the returned
+    // length is identical to the per-chunk scan (bd-2g7oyh).
     const PANEL: usize = WIDE_FIND_LONG_SIMD_LANES; // 64
     const BLOCK: usize = PANEL * 4; // 256
     let zero = Simd::<u32, PANEL>::splat(0);
@@ -338,6 +339,7 @@ pub fn wcslen(s: &[u32]) -> usize {
 /// Returns the length of a wide string, bounded by `maxlen`.
 ///
 /// Equivalent to C `wcsnlen`.
+#[inline(always)]
 pub fn wcsnlen(s: &[u32], maxlen: usize) -> usize {
     // Same folded-block NUL scan as wcslen (bd-2g7oyh.262), bounded by `maxlen`:
     // four 64-lane panels per 256-element block folded with `simd_min` into ONE
@@ -350,75 +352,119 @@ pub fn wcsnlen(s: &[u32], maxlen: usize) -> usize {
     let limit = maxlen.min(s.len());
     let scan = &s[..limit];
 
-    // Short bounded strings never reach the folded 256-wide steady state.
-    // Probe their two ends with overlapping panels instead: the first panel
-    // retains left-to-right precedence, while the tail panel covers the whole
-    // range without a scalar prologue. This is the common ABI `wcsnlen` shape
-    // for fixed-size wide buffers.
-    // Every tier below resolves from the lane mask rather than asking `.any()` and
-    // then re-walking the panel with `.position()`. The compare already produced
-    // the answer; `trailing_zeros` on its bitmask reads it in O(1) where
-    // `.position()` is a scalar scan whose cost grows with the NUL's offset.
-    if (16..32).contains(&limit) {
-        let first = Simd::<u32, 16>::from_slice(&scan[..16]).simd_eq(Simd::splat(0)).to_bitmask();
-        if first != 0 {
-            return first.trailing_zeros() as usize;
+    if limit <= 64 {
+        if limit < 32 {
+            if limit >= 16 {
+                let first = Simd::<u32, 16>::from_slice(&scan[..16])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if first != 0 {
+                    return first.trailing_zeros() as usize;
+                }
+                if limit == 16 {
+                    return 16;
+                }
+                let tail_start = limit - 16;
+                let tail = Simd::<u32, 16>::from_slice(&scan[tail_start..])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if tail != 0 {
+                    return tail_start + tail.trailing_zeros() as usize;
+                }
+                return limit;
+            }
+            if limit >= 8 {
+                let first = Simd::<u32, 8>::from_slice(&scan[..8])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if first != 0 {
+                    return first.trailing_zeros() as usize;
+                }
+                if limit == 8 {
+                    return 8;
+                }
+                let tail_start = limit - 8;
+                let tail = Simd::<u32, 8>::from_slice(&scan[tail_start..])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if tail != 0 {
+                    return tail_start + tail.trailing_zeros() as usize;
+                }
+                return limit;
+            }
+            if limit >= 4 {
+                let first = Simd::<u32, 4>::from_slice(&scan[..4])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if first != 0 {
+                    return first.trailing_zeros() as usize;
+                }
+                if limit == 4 {
+                    return 4;
+                }
+                let tail_start = limit - 4;
+                let tail = Simd::<u32, 4>::from_slice(&scan[tail_start..])
+                    .simd_eq(Simd::splat(0))
+                    .to_bitmask();
+                if tail != 0 {
+                    return tail_start + tail.trailing_zeros() as usize;
+                }
+                return limit;
+            }
+            let mut k = 0usize;
+            while k < limit {
+                if scan[k] == 0 {
+                    return k;
+                }
+                k += 1;
+            }
+            return limit;
+        } else {
+            // 32 <= limit <= 64: direct 16-lane panels with zero loops
+            let z16 = Simd::<u32, 16>::splat(0);
+            let m0 = Simd::<u32, 16>::from_slice(&scan[..16])
+                .simd_eq(z16)
+                .to_bitmask();
+            if m0 != 0 {
+                return m0.trailing_zeros() as usize;
+            }
+            let m1 = Simd::<u32, 16>::from_slice(&scan[16..32])
+                .simd_eq(z16)
+                .to_bitmask();
+            if m1 != 0 {
+                return 16 + m1.trailing_zeros() as usize;
+            }
+            if limit == 32 {
+                return 32;
+            }
+            if limit <= 48 {
+                let tail_start = limit - 16;
+                let tail = Simd::<u32, 16>::from_slice(&scan[tail_start..])
+                    .simd_eq(z16)
+                    .to_bitmask();
+                if tail != 0 {
+                    return tail_start + tail.trailing_zeros() as usize;
+                }
+                return limit;
+            }
+            let m2 = Simd::<u32, 16>::from_slice(&scan[32..48])
+                .simd_eq(z16)
+                .to_bitmask();
+            if m2 != 0 {
+                return 32 + m2.trailing_zeros() as usize;
+            }
+            let tail_start = limit - 16;
+            let tail = Simd::<u32, 16>::from_slice(&scan[tail_start..])
+                .simd_eq(z16)
+                .to_bitmask();
+            if tail != 0 {
+                return tail_start + tail.trailing_zeros() as usize;
+            }
+            return limit;
         }
-        let tail_start = limit - 16;
-        let tail = Simd::<u32, 16>::from_slice(&scan[tail_start..])
-            .simd_eq(Simd::splat(0))
-            .to_bitmask();
-        if tail != 0 {
-            return tail_start + tail.trailing_zeros() as usize;
-        }
-        return limit;
-    }
-    if (8..16).contains(&limit) {
-        let first = Simd::<u32, 8>::from_slice(&scan[..8]).simd_eq(Simd::splat(0)).to_bitmask();
-        if first != 0 {
-            return first.trailing_zeros() as usize;
-        }
-        let tail_start = limit - 8;
-        let tail = Simd::<u32, 8>::from_slice(&scan[tail_start..])
-            .simd_eq(Simd::splat(0))
-            .to_bitmask();
-        if tail != 0 {
-            return tail_start + tail.trailing_zeros() as usize;
-        }
-        return limit;
-    }
-    if (4..8).contains(&limit) {
-        let first = Simd::<u32, 4>::from_slice(&scan[..4]).simd_eq(Simd::splat(0)).to_bitmask();
-        if first != 0 {
-            return first.trailing_zeros() as usize;
-        }
-        let tail_start = limit - 4;
-        let tail = Simd::<u32, 4>::from_slice(&scan[tail_start..])
-            .simd_eq(Simd::splat(0))
-            .to_bitmask();
-        if tail != 0 {
-            return tail_start + tail.trailing_zeros() as usize;
-        }
-        return limit;
     }
 
-    // MEDIUM BOUNDS [32, 256): the tier that was missing. Below this the
-    // overlapping-ends probes above resolve in one or two 16-lane compares; at 256
-    // and above the folded block amortises. In between, a bound fell past every
-    // tier into the 64-LANE panel loop below -- and `Simd::<u32, 64>` is eight ymm
-    // registers, so finding a NUL at element 31 of a 64-element bound loaded eight
-    // vectors to answer what two can.
-    //
-    // Stepped 16-lane panels with early exit instead, then one overlapping panel
-    // ending exactly at `limit` for a bound that is not a multiple of 16. Left-to-
-    // right precedence is preserved: each panel is tested in order and resolved
-    // from its own mask, and the overlapping tail can only report an index at or
-    // after the last full panel it follows.
-    // The RANGE, not just the upper end. The tiers above cover 4..32, so a bare
-    // `limit < BLOCK` also admits 0..=3 -- where `limit - 16` underflows and the
-    // overlapping tail indexes a slice at `usize::MAX - 14`. Caught by the bound
-    // sweep in `wnlen_conf`, which is why that driver exists.
-    if (32..BLOCK).contains(&limit) {
+    if (64..BLOCK).contains(&limit) {
         let z16 = Simd::<u32, 16>::splat(0);
         let mut i = 0usize;
         while i + 16 <= limit {
@@ -431,9 +477,6 @@ pub fn wcsnlen(s: &[u32], maxlen: usize) -> usize {
             i += 16;
         }
         if i < limit {
-            // `limit >= 32` here, so `limit - 16` is a valid start and lies at or
-            // before `i`; lanes below `i` re-test elements already proven non-NUL,
-            // which cannot change the answer.
             let start = limit - 16;
             let m = Simd::<u32, 16>::from_slice(&scan[start..])
                 .simd_eq(z16)
@@ -456,16 +499,21 @@ pub fn wcsnlen(s: &[u32], maxlen: usize) -> usize {
         let p3 = Simd::<u32, PANEL>::from_slice(&block[3 * PANEL..BLOCK]);
         let folded = p0.simd_min(p1).simd_min(p2.simd_min(p3));
         if folded.simd_eq(zero).any() {
-            // The fold says a NUL is somewhere in these 256 elements but not
-            // which panel, so re-test the four panels in order and resolve from
-            // the first non-empty mask. The old form walked the block ELEMENT BY
-            // ELEMENT -- up to 256 scalar iterations to recover an index four
-            // vector compares already hold.
-            for (k, panel) in [p0, p1, p2, p3].iter().enumerate() {
-                let m = panel.simd_eq(zero).to_bitmask();
-                if m != 0 {
-                    return base + k * PANEL + m.trailing_zeros() as usize;
-                }
+            let m0 = p0.simd_eq(zero).to_bitmask();
+            if m0 != 0 {
+                return base + m0.trailing_zeros() as usize;
+            }
+            let m1 = p1.simd_eq(zero).to_bitmask();
+            if m1 != 0 {
+                return base + PANEL + m1.trailing_zeros() as usize;
+            }
+            let m2 = p2.simd_eq(zero).to_bitmask();
+            if m2 != 0 {
+                return base + 2 * PANEL + m2.trailing_zeros() as usize;
+            }
+            let m3 = p3.simd_eq(zero).to_bitmask();
+            if m3 != 0 {
+                return base + 3 * PANEL + m3.trailing_zeros() as usize;
             }
             unreachable!("min-fold reported a NUL that no panel contained");
         }

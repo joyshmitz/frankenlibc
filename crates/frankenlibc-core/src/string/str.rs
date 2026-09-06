@@ -279,6 +279,7 @@ fn byte_membership_table(bytes: &[u8]) -> [bool; 256] {
 /// Equivalent to C `strlen`. Scans `s` for the first `0x00` byte and returns
 /// its index. If no NUL is found, returns the full slice length.
 #[allow(unsafe_code)]
+#[inline]
 pub fn strlen(s: &[u8]) -> usize {
     const WORD_SIZE: usize = size_of::<usize>();
 
@@ -344,6 +345,7 @@ pub fn strlen(s: &[u8]) -> usize {
 /// Equivalent to C `strnlen`. Scans at most `maxlen` bytes and returns:
 /// - index of first `0x00` byte if found before `maxlen`
 /// - otherwise `maxlen` (or `s.len()` when the slice is shorter)
+#[inline(always)]
 pub fn strnlen(s: &[u8], maxlen: usize) -> usize {
     let limit = maxlen.min(s.len());
     strlen(&s[..limit])
@@ -643,6 +645,7 @@ pub fn strchrnul(s: &[u8], c: u8) -> usize {
 }
 
 #[allow(unsafe_code)]
+#[inline]
 fn find_byte_or_nul(s: &[u8], needle: u8) -> usize {
     let mut i = 0;
 
@@ -735,6 +738,7 @@ fn find_ascii_folded_byte_or_nul(s: &[u8], folded: u8) -> usize {
     s.len()
 }
 
+#[inline]
 fn find_any_of4_or_nul(s: &[u8], b0: u8, b1: u8, b2: u8, b3: u8) -> usize {
     let mut simd_chunks = s.chunks_exact(SIMD_LANES);
     let mut base = 0usize;
@@ -759,6 +763,7 @@ fn find_any_of4_or_nul(s: &[u8], b0: u8, b1: u8, b2: u8, b3: u8) -> usize {
     s.len()
 }
 
+#[inline]
 fn find_non_any_of4_or_nul(s: &[u8], b0: u8, b1: u8, b2: u8, b3: u8) -> usize {
     let mut simd_chunks = s.chunks_exact(SIMD_LANES);
     let mut base = 0usize;
@@ -969,6 +974,7 @@ fn span_range(s: &[u8], table: &[bool; 256], stop_in_set: bool, lo: u8, hi: u8) 
 /// Dispatches the `strspn`/`strcspn` general path (set size > 4) to a branchless
 /// SIMD multi-compare for sets up to 16 bytes — padding short sets with a real
 /// member — or a scalar `table` scan for larger sets (rare). `set` is non-empty.
+#[inline]
 fn span_general(s: &[u8], set: &[u8], table: &[bool; 256], stop_in_set: bool) -> usize {
     if let Some((lo, hi)) = contiguous_set_range(set, table) {
         return span_range(s, table, stop_in_set, lo, hi);
@@ -993,6 +999,7 @@ fn span_general(s: &[u8], set: &[u8], table: &[bool; 256], stop_in_set: bool) ->
 }
 
 #[allow(unsafe_code)]
+#[inline]
 fn find_non_byte_or_nul(s: &[u8], accepted: u8) -> usize {
     const WORD_SIZE: usize = size_of::<usize>();
 
@@ -1235,6 +1242,7 @@ pub fn strncasecmp(s1: &[u8], s2: &[u8], n: usize) -> i32 {
 /// bytes in `accept`.
 ///
 /// Equivalent to C `strspn`.
+#[inline(always)]
 pub fn strspn(s: &[u8], accept: &[u8]) -> usize {
     let accept_len = strlen(accept);
     strspn_set(s, &accept[..accept_len])
@@ -1246,6 +1254,7 @@ pub fn strspn(s: &[u8], accept: &[u8]) -> usize {
 /// `strtok`/`strtok_r` hold their delimiters as a plain slice and would
 /// otherwise need their own scalar membership loop; this lets them reuse the
 /// same scanners `strspn` uses. [`strspn`] is the NUL-terminated wrapper.
+#[inline(always)]
 pub(crate) fn strspn_set(s: &[u8], accept_set: &[u8]) -> usize {
     match accept_set.len() {
         0 => return 0,
@@ -1294,6 +1303,7 @@ pub(crate) fn strspn_set(s: &[u8], accept_set: &[u8]) -> usize {
 /// bytes NOT in `reject`.
 ///
 /// Equivalent to C `strcspn`.
+#[inline(always)]
 pub fn strcspn(s: &[u8], reject: &[u8]) -> usize {
     let reject_len = strlen(reject);
     strcspn_set(s, &reject[..reject_len])
@@ -1301,6 +1311,7 @@ pub fn strcspn(s: &[u8], reject: &[u8]) -> usize {
 
 /// `strcspn` over an EXACT reject set. Companion to [`strspn_set`] for
 /// `strtok`-style callers whose delimiter slice is not NUL-terminated.
+#[inline(always)]
 pub(crate) fn strcspn_set(s: &[u8], reject_set: &[u8]) -> usize {
     match reject_set.len() {
         0 => return strlen(s),
@@ -1348,6 +1359,7 @@ pub(crate) fn strcspn_set(s: &[u8], reject_set: &[u8]) -> usize {
 /// Locates the first occurrence of any byte from `accept` in `s`.
 ///
 /// Equivalent to C `strpbrk`. Returns the index of the first match, or `None`.
+#[inline(always)]
 pub fn strpbrk(s: &[u8], accept: &[u8]) -> Option<usize> {
     let accept_len = strlen(accept);
     match accept_len {
@@ -1414,6 +1426,7 @@ pub fn strpbrk(s: &[u8], accept: &[u8]) -> Option<usize> {
 ///
 /// Equivalent to GNU `strcasestr`. Returns the byte index where `needle` starts,
 /// or `None` if not found.
+#[inline(always)]
 pub fn strcasestr(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let n_len = strlen(needle);
 

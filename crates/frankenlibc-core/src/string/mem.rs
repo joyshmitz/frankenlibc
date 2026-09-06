@@ -3,7 +3,7 @@
 //! These are safe Rust implementations operating on byte slices.
 //! They correspond to the `<string.h>` memory functions in POSIX/C.
 
-use std::simd::{cmp::SimdPartialEq, Simd};
+use std::simd::{Simd, cmp::SimdPartialEq};
 
 /// Copies `n` bytes from `src` to `dest`.
 ///
@@ -53,6 +53,7 @@ pub fn memset(dest: &mut [u8], value: u8, n: usize) -> usize {
 /// - `Ordering::Greater` if `a > b`
 ///
 /// Only compares `min(n, a.len(), b.len())` bytes.
+#[inline(always)]
 pub fn memcmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
     let count = n.min(a.len()).min(b.len());
 
@@ -133,9 +134,6 @@ fn memcmp_exact_16_mask(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
     }
 }
 
-/// True iff the two 32-byte panels are byte-for-byte equal. Safe portable SIMD
-/// equality probe; both inputs must be exactly [`SIMD_LANES`] bytes long.
-#[inline(always)]
 /// First differing byte of a 32-byte panel, or `None` if the panels are equal.
 ///
 /// The `simd_ne` control mask already names the differing lanes, so the ordering answer is
@@ -378,6 +376,7 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 /// Scans absent-heavy prefixes as folded 256-byte SIMD blocks, then resolves
 /// the exact index within the first matching panel low-to-high. Behaviour is
 /// identical to a byte-at-a-time `position` scan.
+#[inline(always)]
 pub fn memchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
     let count = n.min(haystack.len());
     let hs = &haystack[..count];
@@ -640,6 +639,7 @@ pub fn memrchr(haystack: &[u8], needle: u8, n: usize) -> Option<usize> {
 ///
 /// Equivalent to GNU `memmem`. Returns the index of the first occurrence,
 /// or `None` if not found.
+#[inline(always)]
 pub fn memmem(haystack: &[u8], n: usize, needle: &[u8], needle_len: usize) -> Option<usize> {
     let h_count = n.min(haystack.len());
     let n_count = needle_len.min(needle.len());
@@ -754,11 +754,7 @@ pub fn memmem(haystack: &[u8], n: usize, needle: &[u8], needle_len: usize) -> Op
 /// away), ASCII lowercase when true.
 #[inline(always)]
 fn fold_case<const ICASE: bool>(b: u8) -> u8 {
-    if ICASE {
-        b.to_ascii_lowercase()
-    } else {
-        b
-    }
+    if ICASE { b.to_ascii_lowercase() } else { b }
 }
 
 fn two_way_search(hay: &[u8], ndl: &[u8]) -> Option<usize> {
@@ -904,6 +900,7 @@ fn two_way_search_impl<const ICASE: bool>(hay: &[u8], ndl: &[u8]) -> Option<usiz
 ///
 /// Returns the number of bytes copied (which is also the index of the next
 /// unwritten byte in `dest`).
+#[inline(always)]
 pub fn mempcpy(dest: &mut [u8], src: &[u8], n: usize) -> usize {
     let count = n.min(dest.len()).min(src.len());
     dest[..count].copy_from_slice(&src[..count]);
@@ -914,6 +911,7 @@ pub fn mempcpy(dest: &mut [u8], src: &[u8], n: usize) -> usize {
 ///
 /// Equivalent to POSIX `memccpy`. Returns the index one past the copied byte `c`,
 /// or `None` if `c` was not found within `n` bytes.
+#[inline(always)]
 pub fn memccpy(dest: &mut [u8], src: &[u8], c: u8, n: usize) -> Option<usize> {
     let count = n.min(dest.len()).min(src.len());
 
@@ -947,6 +945,7 @@ pub fn memccpy(dest: &mut [u8], src: &[u8], c: u8, n: usize) -> Option<usize> {
 /// Sets `n` bytes of `dest` to zero, guaranteed not to be optimized away.
 ///
 /// Equivalent to `explicit_bzero` / `bzero`.
+#[inline(always)]
 pub fn bzero(dest: &mut [u8], n: usize) {
     let count = n.min(dest.len());
     for byte in &mut dest[..count] {
@@ -960,6 +959,7 @@ pub fn bzero(dest: &mut [u8], n: usize) {
 /// Compares `n` bytes of `a` and `b`. Returns 0 if equal, non-zero otherwise.
 ///
 /// Equivalent to legacy BSD `bcmp`.
+#[inline(always)]
 pub fn bcmp(a: &[u8], b: &[u8], n: usize) -> i32 {
     let count = n.min(a.len()).min(b.len());
     let a = &a[..count];
@@ -1004,6 +1004,7 @@ pub fn bcmp(a: &[u8], b: &[u8], n: usize) -> i32 {
 /// Swaps adjacent bytes in pairs from `src` into `dest`.
 ///
 /// Equivalent to POSIX `swab`. Processes `n` bytes (n should be even).
+#[inline(always)]
 pub fn swab(src: &[u8], dest: &mut [u8], n: usize) -> usize {
     let pairs = n.min(src.len()).min(dest.len()) / 2;
     for i in 0..pairs {

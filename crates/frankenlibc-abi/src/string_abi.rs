@@ -2090,6 +2090,7 @@ fn swar_word_has_zero(w: u64) -> bool {
 /// a cap imports that one, and this function is only ever called FULLY QUALIFIED
 /// (see `tests/capped_scans_use_the_scalar_scanner.rs`). For a caller-supplied
 /// ceiling that must still be fast, use [`scan_c_string_nul_or_bound`].
+#[inline(always)]
 pub(crate) unsafe fn scan_c_string(ptr: *const c_char, bound: Option<usize>) -> (usize, bool) {
     let p = ptr.cast::<u8>();
     match bound {
@@ -2111,22 +2112,91 @@ pub(crate) unsafe fn scan_c_string(ptr: *const c_char, bound: Option<usize>) -> 
             // in this scanner against 19 Ir for the identical string scanned
             // unbounded — the bound, not the bytes, was the cost.
             //
-            // Both arms sit under ONE `limit < 32` test. Adding the `[8,16)` arm
-            // as a second top-level range check instead cost every larger bound
-            // an extra comparison, measured at 2-4 Ir for bounds 21 and 41; this
-            // shape charges a bound of 32 or more a single compare, which is one
-            // fewer than the original `(16..32).contains` did.
-            if limit < 32 {
-                if limit >= 16 {
+            if limit <= 64 {
+                if limit < 32 {
+                    if limit >= 16 {
+                        let v0 = Simd::<u8, 16>::from_slice(unsafe {
+                            core::slice::from_raw_parts(p, 16)
+                        });
+                        let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m0 != 0 {
+                            return (m0.trailing_zeros() as usize, true);
+                        }
+                        if limit == 16 {
+                            return (16, false);
+                        }
+                        let off = limit - 16;
+                        let v1 = Simd::<u8, 16>::from_slice(unsafe {
+                            core::slice::from_raw_parts(p.add(off), 16)
+                        });
+                        let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m1 != 0 {
+                            return (off + m1.trailing_zeros() as usize, true);
+                        }
+                        return (limit, false);
+                    }
+                    if limit >= 8 {
+                        let v0 =
+                            Simd::<u8, 8>::from_slice(unsafe { core::slice::from_raw_parts(p, 8) });
+                        let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m0 != 0 {
+                            return (m0.trailing_zeros() as usize, true);
+                        }
+                        if limit == 8 {
+                            return (8, false);
+                        }
+                        let off = limit - 8;
+                        let v1 = Simd::<u8, 8>::from_slice(unsafe {
+                            core::slice::from_raw_parts(p.add(off), 8)
+                        });
+                        let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m1 != 0 {
+                            return (off + m1.trailing_zeros() as usize, true);
+                        }
+                        return (limit, false);
+                    }
+                    if limit >= 4 {
+                        let v0 =
+                            Simd::<u8, 4>::from_slice(unsafe { core::slice::from_raw_parts(p, 4) });
+                        let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m0 != 0 {
+                            return (m0.trailing_zeros() as usize, true);
+                        }
+                        if limit == 4 {
+                            return (4, false);
+                        }
+                        let off = limit - 4;
+                        let v1 = Simd::<u8, 4>::from_slice(unsafe {
+                            core::slice::from_raw_parts(p.add(off), 4)
+                        });
+                        let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
+                        if m1 != 0 {
+                            return (off + m1.trailing_zeros() as usize, true);
+                        }
+                        return (limit, false);
+                    }
+                    let mut k = 0usize;
+                    while k < limit {
+                        if unsafe { *p.add(k) } == 0 {
+                            return (k, true);
+                        }
+                        k += 1;
+                    }
+                    return (limit, false);
+                } else {
+                    // 32 <= limit <= 64: two overlapping 32-byte SIMD probes cover the entire span.
                     let v0 =
-                        Simd::<u8, 16>::from_slice(unsafe { core::slice::from_raw_parts(p, 16) });
+                        Simd::<u8, 32>::from_slice(unsafe { core::slice::from_raw_parts(p, 32) });
                     let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
                     if m0 != 0 {
                         return (m0.trailing_zeros() as usize, true);
                     }
-                    let off = limit - 16;
-                    let v1 = Simd::<u8, 16>::from_slice(unsafe {
-                        core::slice::from_raw_parts(p.add(off), 16)
+                    if limit == 32 {
+                        return (32, false);
+                    }
+                    let off = limit - 32;
+                    let v1 = Simd::<u8, 32>::from_slice(unsafe {
+                        core::slice::from_raw_parts(p.add(off), 32)
                     });
                     let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
                     if m1 != 0 {
@@ -2134,55 +2204,6 @@ pub(crate) unsafe fn scan_c_string(ptr: *const c_char, bound: Option<usize>) -> 
                     }
                     return (limit, false);
                 }
-                if limit >= 8 {
-                    // `p[0..8]` and `p[limit-8..limit]` are both inside `[0, limit)`
-                    // because `limit >= 8`. First-NUL ordering holds for the same
-                    // reason as the 16-byte case: probe 0 owns `[0,8)`, so if it is
-                    // empty every NUL position below 8 is ruled out and probe 1's
-                    // lowest set bit is the true first NUL at or above 8.
-                    let v0 =
-                        Simd::<u8, 8>::from_slice(unsafe { core::slice::from_raw_parts(p, 8) });
-                    let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
-                    if m0 != 0 {
-                        return (m0.trailing_zeros() as usize, true);
-                    }
-                    let off = limit - 8;
-                    let v1 = Simd::<u8, 8>::from_slice(unsafe {
-                        core::slice::from_raw_parts(p.add(off), 8)
-                    });
-                    let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
-                    if m1 != 0 {
-                        return (off + m1.trailing_zeros() as usize, true);
-                    }
-                    return (limit, false);
-                }
-                if limit >= 4 {
-                    // ...and once more for `[4, 8)`, the band a `malloc(5)`-backed
-                    // string lands in. That gap was noted when the `[8,16)` arm was
-                    // added and left unfixed, and a length sweep then showed what it
-                    // costs: heap `strlen` runs 142 Ir at L=4 but only 111 at L=8 and
-                    // 104 at L=16 -- NON-MONOTONIC, the shortest string the most
-                    // expensive, because bound 5 fell past every tier into the generic
-                    // ladder. At 10.918x vs glibc that was the worst measured point in
-                    // the whole suite. Two overlapping 4-byte probes cover it; both
-                    // reads sit inside `[0, limit)` because `limit >= 4`.
-                    let v0 =
-                        Simd::<u8, 4>::from_slice(unsafe { core::slice::from_raw_parts(p, 4) });
-                    let m0 = v0.simd_eq(Simd::splat(0)).to_bitmask();
-                    if m0 != 0 {
-                        return (m0.trailing_zeros() as usize, true);
-                    }
-                    let off = limit - 4;
-                    let v1 = Simd::<u8, 4>::from_slice(unsafe {
-                        core::slice::from_raw_parts(p.add(off), 4)
-                    });
-                    let m1 = v1.simd_eq(Simd::splat(0)).to_bitmask();
-                    if m1 != 0 {
-                        return (off + m1.trailing_zeros() as usize, true);
-                    }
-                    return (limit, false);
-                }
-                // `limit < 4` falls through to the generic ladder below.
             }
             let mut i = 0usize;
             // 128-byte folded tier for large bounded scans: ONE combined NUL check per
@@ -2257,25 +2278,20 @@ pub(crate) unsafe fn scan_c_string(ptr: *const c_char, bound: Option<usize>) -> 
                 }
                 i += 32;
             }
-            while i + 8 <= limit {
-                // SAFETY: [i, i+8) ⊆ [0, limit); caller guarantees `limit` readable bytes.
-                let w = unsafe { core::ptr::read_unaligned(p.add(i).cast::<u64>()) };
-                if swar_word_has_zero(w) {
-                    for j in 0..8 {
-                        // SAFETY: i+j < limit.
-                        if unsafe { *p.add(i + j) } == 0 {
-                            return (i + j, true);
-                        }
-                    }
+            if i < limit {
+                // Since limit > 64 and i is within 31 bytes of limit,
+                // limit >= 32, so an overlapping 32-byte SIMD probe at limit - 32
+                // covers all remaining bytes [i, limit) in ONE shot!
+                use core::simd::Simd;
+                use core::simd::cmp::SimdPartialEq;
+                let off = limit - 32;
+                let v = Simd::<u8, 32>::from_slice(unsafe {
+                    core::slice::from_raw_parts(p.add(off), 32)
+                });
+                let mask = v.simd_eq(Simd::splat(0)).to_bitmask();
+                if mask != 0 {
+                    return (off + mask.trailing_zeros() as usize, true);
                 }
-                i += 8;
-            }
-            while i < limit {
-                // SAFETY: i < limit.
-                if unsafe { *p.add(i) } == 0 {
-                    return (i, true);
-                }
-                i += 1;
             }
             (limit, false)
         }
@@ -2283,12 +2299,6 @@ pub(crate) unsafe fn scan_c_string(ptr: *const c_char, bound: Option<usize>) -> 
             use core::simd::Simd;
             use core::simd::cmp::SimdPartialEq;
             // glibc-style aligned-load-with-head-mask: align the pointer DOWN to a
-            // 32-byte boundary and do one aligned load, masking off the `align`
-            // bytes that precede `ptr`. A 32-byte-aligned 32-byte window is always
-            // contained in a single 4 KiB page (32 | 4096), and the page holding
-            // `ptr` is mapped, so reading the head bytes `base..ptr` (same page) is
-            // safe. This eliminates BOTH the scalar head-align scan and the
-            // per-iteration page-cross guard the old loop paid on every chunk — the
             // residual short-string floor identified in NEGATIVE_EVIDENCE.md.
             let align = (p as usize) & 31;
             // SAFETY: `base` is in the same mapped page as `p` (aligned down ≤ 31
@@ -2426,6 +2436,7 @@ const SCAN_PAGE: usize = 4096;
 ///
 /// `ptr` must be readable up to the first NUL or `bound` bytes, whichever comes
 /// first. That is strictly weaker than what [`scan_c_string`] requires.
+#[inline(always)]
 pub(crate) unsafe fn scan_c_string_nul_or_bound(ptr: *const c_char, bound: usize) -> (usize, bool) {
     // Fast path: `[ptr, ptr+bound)` lies in one page, and that page is mapped
     // because `ptr` is readable — so every byte the scan may load is readable and
