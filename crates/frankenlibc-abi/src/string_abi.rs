@@ -1215,14 +1215,8 @@ unsafe fn raw_strstr(haystack: *const c_char, needle: *const c_char) -> *mut c_c
         // path, then route the MATCH to the pure core Two-Way searcher instead of the old
         // naive O(hay*needle) double loop (a latent quadratic-DoS vector even here). core
         // memmem allocates nothing and holds no locks, so it is safe in this context.
-        let mut hay_len = 0usize;
-        while *haystack.add(hay_len) != 0 {
-            hay_len += 1;
-        }
-        let mut needle_len = 0usize;
-        while *needle.add(needle_len) != 0 {
-            needle_len += 1;
-        }
+        let hay_len = unsafe { scan_c_string(haystack, None).0 };
+        let needle_len = unsafe { scan_c_string(needle, None).0 };
         if hay_len < needle_len {
             return std::ptr::null_mut();
         }
@@ -4920,13 +4914,7 @@ pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
     // 2.0ns = 3.2x, while the raw SIMD kernel is at parity). Hoisting only the one
     // cheap phase-read out front lets the strict fast path skip the other four.
     if runtime_policy::bootstrap_passthrough_active() {
-        unsafe {
-            let mut len = 0usize;
-            while *s.add(len) != 0 {
-                len += 1;
-            }
-            return len;
-        }
+        return unsafe { scan_c_string(s, None).0 };
     }
 
     // Strict-mode fast path (the DEFAULT deployed mode): an untracked string has the
@@ -4956,13 +4944,7 @@ pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
     // Hardened mode only: the remaining reentry/TLS-access bypasses before the
     // validating membrane (the bootstrap term is harmlessly re-checked here).
     if string_raw_passthrough_active() {
-        unsafe {
-            let mut len = 0usize;
-            while *s.add(len) != 0 {
-                len += 1;
-            }
-            return len;
-        }
+        return unsafe { scan_c_string(s, None).0 };
     }
 
     // Cold tail in its own frame — but split BELOW the bypass above, not above it.

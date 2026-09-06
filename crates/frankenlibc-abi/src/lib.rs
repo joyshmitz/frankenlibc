@@ -107,6 +107,7 @@ extern "C" fn frankenlibc_abi_stdio_init_entry() {
     // publishes the stdio globals/aliases onto stable NativeFile storage while
     // patching host libio exit handling for the exported _IO symbols.
     stdio_abi::init_host_stdio_streams();
+    runtime_policy::signal_runtime_ready();
 }
 
 // Phase 2+ ABI modules — call libc syscalls, gated to prevent symbol recursion in tests
